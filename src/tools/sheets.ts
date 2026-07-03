@@ -72,9 +72,14 @@ export function a1ToGridRange(
   };
 }
 
+const cellValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const valuesField = z.array(z.array(cellValue)).describe("2D array of rows × columns.");
+const valueInputOptionField = z.enum(["USER_ENTERED", "RAW"]).default("USER_ENTERED").optional();
+
 export function registerSheetsTools(server: McpServer, clients: UserClients) {
   const account = accountField(clients);
 
+  // ── sheets_list ────────────────────────────────────────────────────────────
   server.registerTool(
     "sheets_list",
     {
@@ -107,226 +112,394 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
       });
       const files = res.data.files ?? [];
       return ok({
-        summary: `📋 ${files.length} spreadsheet(s)${nameContains ? ` matching "${nameContains}"` : ""} on account "${account ?? "default"}"`,
+        summary: `${files.length} spreadsheet(s)${nameContains ? ` matching "${nameContains}"` : ""} on account "${account ?? "default"}"`,
         files,
       });
     }),
   );
 
+  // ── sheets_get_info ────────────────────────────────────────────────────────
   server.registerTool(
     "sheets_get_info",
     {
       title: "Get spreadsheet info",
       description:
-        "Get a spreadsheet's title and the list of its sheets/tabs (with sheetId, index, row/column counts).",
+        "Get title and sheet/tab list for one or more spreadsheets. Returns per-item results; errors are captured per item.",
       inputSchema: {
         account,
-        spreadsheetId: z.string().describe("The spreadsheet ID."),
+        spreadsheetIds: z.array(z.string()).min(1).describe("One or more spreadsheet IDs."),
       },
     },
-    guard(async ({ account, spreadsheetId }) => {
+    guard(async ({ account, spreadsheetIds }) => {
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.get({
-        spreadsheetId,
-        fields:
-          "spreadsheetId,properties.title,spreadsheetUrl,sheets(properties(sheetId,title,index,gridProperties))",
-      });
-      const tabCount = res.data.sheets?.length ?? 0;
-      const tabNames = (res.data.sheets ?? []).map((s) => s.properties?.title ?? "?").join(", ");
+      const results = await Promise.all(
+        spreadsheetIds.map(async (spreadsheetId) => {
+          try {
+            const res = await g.sheets.spreadsheets.get({
+              spreadsheetId,
+              fields:
+                "spreadsheetId,properties.title,spreadsheetUrl,sheets(properties(sheetId,title,index,gridProperties))",
+            });
+            return {
+              spreadsheetId: res.data.spreadsheetId ?? spreadsheetId,
+              title: res.data.properties?.title,
+              spreadsheetUrl: res.data.spreadsheetUrl,
+              sheets: res.data.sheets,
+            };
+          } catch (e: unknown) {
+            return { spreadsheetId, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_count = results.filter((r) => !("error" in r)).length;
       return ok({
-        summary: `ℹ️ "${res.data.properties?.title ?? spreadsheetId}" — ${tabCount} tab(s): ${tabNames}`,
-        spreadsheetId: res.data.spreadsheetId,
-        title: res.data.properties?.title,
-        spreadsheetUrl: res.data.spreadsheetUrl,
-        sheets: res.data.sheets,
+        summary: `Got info for ${ok_count}/${spreadsheetIds.length} spreadsheet(s)`,
+        results,
       });
     }),
   );
 
+  // ── sheets_read_range ──────────────────────────────────────────────────────
   server.registerTool(
     "sheets_read_range",
     {
       title: "Read range",
       description:
-        "Read cell values from an A1 range, e.g. 'Sheet1!A1:D20'. Returns a 2D array of values.",
+        "Read cell values from one or more A1 ranges. Runs in parallel. Returns per-item results.",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
-        range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:D20' or 'Sheet1'."),
+        items: z
+          .array(
+            z.object({
+              spreadsheetId: z.string(),
+              range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:D20' or 'Sheet1'."),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, spreadsheetId, range }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.values.get({ spreadsheetId, range });
-      const values = res.data.values ?? [];
-      const cols = values.reduce((n, row) => Math.max(n, row.length), 0);
+      const results = await Promise.all(
+        items.map(async ({ spreadsheetId, range }) => {
+          try {
+            const res = await g.sheets.spreadsheets.values.get({ spreadsheetId, range });
+            const values = res.data.values ?? [];
+            const cols = values.reduce((n, row) => Math.max(n, row.length), 0);
+            return {
+              spreadsheetId,
+              range: res.data.range ?? range,
+              values,
+              summary: `${values.length} row(s), ${cols} col(s)`,
+            };
+          } catch (e: unknown) {
+            return { spreadsheetId, range, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_count = results.filter((r) => !("error" in r)).length;
       return ok({
-        summary: `📖 Read ${res.data.range ?? range} — ${values.length} row(s), ${cols} col(s)`,
-        range: res.data.range,
-        values,
+        summary: `Read ${ok_count}/${items.length} range(s)`,
+        results,
       });
     }),
   );
 
+  // ── sheets_write_range ─────────────────────────────────────────────────────
+  // Absorbs the old sheets_batch_write: pass multiple items with the same spreadsheetId
+  // to write several ranges. Items targeting the same spreadsheet are written
+  // via batchUpdate in one call; different spreadsheets are written sequentially
+  // (to avoid conflicts within a spreadsheet while allowing parallelism across them).
   server.registerTool(
     "sheets_write_range",
     {
-      title: "Write range",
+      title: "Write range(s)",
       description:
-        "Overwrite cell values in an A1 range with a 2D array. `valueInputOption` USER_ENTERED parses formulas/numbers like the UI; RAW stores text verbatim.",
+        "Overwrite cell values in one or more A1 ranges. " +
+        "Items for the same spreadsheet are batched into one API call. " +
+        "Items for different spreadsheets run sequentially. " +
+        "`valueInputOption` USER_ENTERED parses formulas/numbers like the UI; RAW stores text verbatim.",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
-        range: z.string().describe("A1 notation of the top-left target, e.g. 'Sheet1!A1'."),
-        values: z
-          .array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])))
-          .describe("2D array of rows × columns."),
-        valueInputOption: z.enum(["USER_ENTERED", "RAW"]).default("USER_ENTERED").optional(),
+        items: z
+          .array(
+            z.object({
+              spreadsheetId: z.string(),
+              range: z.string().describe("A1 notation of the top-left target, e.g. 'Sheet1!A1'."),
+              values: valuesField,
+              valueInputOption: valueInputOptionField,
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, spreadsheetId, range, values, valueInputOption }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.values.update({
-        spreadsheetId,
-        range,
-        valueInputOption: valueInputOption ?? "USER_ENTERED",
-        requestBody: { values },
-      });
+
+      // Group by spreadsheetId
+      const byId = new Map<string, typeof items>();
+      for (const item of items) {
+        const list = byId.get(item.spreadsheetId) ?? [];
+        list.push(item);
+        byId.set(item.spreadsheetId, list);
+      }
+
+      const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; updatedCells?: number | null; error?: string }> = [];
+
+      for (const [spreadsheetId, group] of byId) {
+        if (group.length === 1) {
+          // Single range — use values.update
+          const { range, values, valueInputOption } = group[0];
+          try {
+            const res = await g.sheets.spreadsheets.values.update({
+              spreadsheetId,
+              range,
+              valueInputOption: valueInputOption ?? "USER_ENTERED",
+              requestBody: { values },
+            });
+            results.push({
+              spreadsheetId,
+              updatedRange: res.data.updatedRange ?? range,
+              updatedCells: res.data.updatedCells,
+            });
+          } catch (e: unknown) {
+            results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+          }
+        } else {
+          // Multiple ranges — use values.batchUpdate
+          const vio = group[0].valueInputOption ?? "USER_ENTERED";
+          try {
+            const res = await g.sheets.spreadsheets.values.batchUpdate({
+              spreadsheetId,
+              requestBody: {
+                valueInputOption: vio,
+                data: group.map(({ range, values }) => ({ range, values })),
+              },
+            });
+            for (const resp of res.data.responses ?? []) {
+              results.push({
+                spreadsheetId,
+                updatedRange: resp.updatedRange ?? undefined,
+                updatedCells: resp.updatedCells,
+              });
+            }
+          } catch (e: unknown) {
+            results.push({ spreadsheetId, error: String(e instanceof Error ? e.message : e) });
+          }
+        }
+      }
+
+      const ok_count = results.filter((r) => !r.error).length;
       return ok({
-        summary: `✏️ Wrote ${values.length} row(s) to ${res.data.updatedRange ?? range}`,
-        updatedRange: res.data.updatedRange,
-        updatedRows: res.data.updatedRows,
-        updatedColumns: res.data.updatedColumns,
-        updatedCells: res.data.updatedCells,
+        summary: `Wrote ${ok_count}/${items.length} range(s)`,
+        results,
       });
     }),
   );
 
+  // ── sheets_append_rows ─────────────────────────────────────────────────────
   server.registerTool(
     "sheets_append_rows",
     {
       title: "Append rows",
       description:
-        "Append rows to the end of the data in a sheet. `range` is used to find the table (e.g. 'Sheet1').",
+        "Append rows to the end of data in one or more sheets. Items run sequentially per spreadsheet.",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
-        range: z.string().describe("Sheet/table to append to, e.g. 'Sheet1'."),
-        values: z.array(
-          z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])),
-        ),
-        valueInputOption: z.enum(["USER_ENTERED", "RAW"]).default("USER_ENTERED").optional(),
+        items: z
+          .array(
+            z.object({
+              spreadsheetId: z.string(),
+              range: z.string().describe("Sheet/table to append to, e.g. 'Sheet1'."),
+              values: valuesField,
+              valueInputOption: valueInputOptionField,
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, spreadsheetId, range, values, valueInputOption }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.values.append({
-        spreadsheetId,
-        range,
-        valueInputOption: valueInputOption ?? "USER_ENTERED",
-        insertDataOption: "INSERT_ROWS",
-        requestBody: { values },
-      });
+      const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; error?: string }> = [];
+
+      for (const { spreadsheetId, range, values, valueInputOption } of items) {
+        try {
+          const res = await g.sheets.spreadsheets.values.append({
+            spreadsheetId,
+            range,
+            valueInputOption: valueInputOption ?? "USER_ENTERED",
+            insertDataOption: "INSERT_ROWS",
+            requestBody: { values },
+          });
+          results.push({
+            spreadsheetId,
+            updatedRange: res.data.updates?.updatedRange ?? range,
+          });
+        } catch (e: unknown) {
+          results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+
+      const ok_count = results.filter((r) => !r.error).length;
       return ok({
-        summary: `➕ Appended ${values.length} row(s) to ${res.data.updates?.updatedRange ?? range}`,
-        updates: res.data.updates,
+        summary: `Appended to ${ok_count}/${items.length} range(s)`,
+        results,
       });
     }),
   );
 
+  // ── sheets_clear_range ─────────────────────────────────────────────────────
   server.registerTool(
     "sheets_clear_range",
     {
       title: "Clear range",
       description:
-        "Clear the values from an A1 range (keeps formatting). " +
-        "Returns the values that were cleared so it's clear what was removed. " +
-        "Pass `_sheetTitle` if known — it appears in the approval dialog.",
+        "Clear values from one or more A1 ranges (keeps formatting). Items run sequentially.",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
-        range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:D20'."),
-        _sheetTitle: z.string().optional().describe("Spreadsheet title (for the approval dialog — fill from context if known)."),
+        items: z
+          .array(
+            z.object({
+              spreadsheetId: z.string(),
+              range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:D20'."),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, spreadsheetId, range }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      let clearedValues: unknown[][] = [];
-      try {
-        const before = await g.sheets.spreadsheets.values.get({ spreadsheetId, range });
-        clearedValues = before.data.values ?? [];
-      } catch {
-        // If the read fails, still proceed with the clear.
+      const results: Array<{ spreadsheetId: string; range?: string; clearedRange?: string; clearedRowCount?: number; error?: string }> = [];
+
+      for (const { spreadsheetId, range } of items) {
+        try {
+          let clearedValues: unknown[][] = [];
+          try {
+            const before = await g.sheets.spreadsheets.values.get({ spreadsheetId, range });
+            clearedValues = before.data.values ?? [];
+          } catch {
+            // If the read fails, still proceed with the clear.
+          }
+          const res = await g.sheets.spreadsheets.values.clear({ spreadsheetId, range });
+          results.push({
+            spreadsheetId,
+            clearedRange: res.data.clearedRange ?? range,
+            clearedRowCount: clearedValues.length,
+          });
+        } catch (e: unknown) {
+          results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+        }
       }
-      const res = await g.sheets.spreadsheets.values.clear({ spreadsheetId, range });
-      const cellCount = clearedValues.reduce((n, row) => n + (row?.length ?? 0), 0);
+
+      const ok_count = results.filter((r) => !r.error).length;
       return ok({
-        summary: `🧹 Cleared ${res.data.clearedRange ?? range} — ${clearedValues.length} row(s), ${cellCount} non-empty cell(s)`,
-        clearedRange: res.data.clearedRange,
-        clearedRowCount: clearedValues.length,
-        clearedValues,
+        summary: `Cleared ${ok_count}/${items.length} range(s)`,
+        results,
       });
     }),
   );
 
+  // ── sheets_create ──────────────────────────────────────────────────────────
   server.registerTool(
     "sheets_create",
     {
       title: "Create spreadsheet",
-      description: "Create a new spreadsheet and return its id and URL.",
+      description: "Create one or more new spreadsheets. Returns per-item results.",
       inputSchema: {
         account,
-        title: z.string().describe("Title of the new spreadsheet."),
-        sheetTitles: z
-          .array(z.string())
-          .optional()
-          .describe("Optional list of tab names to create."),
+        spreadsheets: z
+          .array(
+            z.object({
+              title: z.string().describe("Title of the new spreadsheet."),
+              sheetTitles: z
+                .array(z.string())
+                .optional()
+                .describe("Optional list of tab names to create."),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, title, sheetTitles }) => {
+    guard(async ({ account, spreadsheets }) => {
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.create({
-        requestBody: {
-          properties: { title },
-          sheets: sheetTitles?.length
-            ? sheetTitles.map((t) => ({ properties: { title: t } }))
-            : undefined,
-        },
-        fields: "spreadsheetId,spreadsheetUrl,properties.title",
-      });
+      const results = await Promise.all(
+        spreadsheets.map(async ({ title, sheetTitles }) => {
+          try {
+            const res = await g.sheets.spreadsheets.create({
+              requestBody: {
+                properties: { title },
+                sheets: sheetTitles?.length
+                  ? sheetTitles.map((t) => ({ properties: { title: t } }))
+                  : undefined,
+              },
+              fields: "spreadsheetId,spreadsheetUrl,properties.title",
+            });
+            return {
+              spreadsheetId: res.data.spreadsheetId,
+              title: res.data.properties?.title ?? title,
+              spreadsheetUrl: res.data.spreadsheetUrl,
+            };
+          } catch (e: unknown) {
+            return { title, error: String(e instanceof Error ? e.message : e) };
+          }
+        }),
+      );
+      const ok_count = results.filter((r) => !("error" in r)).length;
       return ok({
-        summary: `📊 Created spreadsheet "${res.data.properties?.title ?? title}"`,
-        spreadsheetId: res.data.spreadsheetId,
-        spreadsheetUrl: res.data.spreadsheetUrl,
-        title: res.data.properties?.title,
+        summary: `Created ${ok_count}/${spreadsheets.length} spreadsheet(s)`,
+        results,
       });
     }),
   );
 
+  // ── sheets_add_tab ─────────────────────────────────────────────────────────
   server.registerTool(
     "sheets_add_tab",
     {
       title: "Add a tab/sheet",
-      description: "Add a new tab (sheet) to an existing spreadsheet.",
+      description: "Add one or more new tabs to existing spreadsheets. Items run sequentially.",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
-        title: z.string().describe("Name of the new tab."),
+        items: z
+          .array(
+            z.object({
+              spreadsheetId: z.string(),
+              title: z.string().describe("Name of the new tab."),
+            }),
+          )
+          .min(1),
       },
     },
-    guard(async ({ account, spreadsheetId, title }) => {
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: { requests: [{ addSheet: { properties: { title } } }] },
-      });
+      const results: Array<{ spreadsheetId: string; sheetId?: number; title?: string; error?: string }> = [];
+
+      for (const { spreadsheetId, title } of items) {
+        try {
+          const res = await g.sheets.spreadsheets.batchUpdate({
+            spreadsheetId,
+            requestBody: { requests: [{ addSheet: { properties: { title } } }] },
+          });
+          const props = res.data.replies?.[0]?.addSheet?.properties;
+          results.push({
+            spreadsheetId,
+            sheetId: props?.sheetId ?? undefined,
+            title: props?.title ?? title,
+          });
+        } catch (e: unknown) {
+          results.push({ spreadsheetId, title, error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+
+      const ok_count = results.filter((r) => !r.error).length;
       return ok({
-        summary: `📄 Added tab "${title}" to spreadsheet`,
-        addedSheet: res.data.replies?.[0]?.addSheet?.properties,
+        summary: `Added ${ok_count}/${items.length} tab(s)`,
+        results,
       });
     }),
   );
 
+  // ── sheets_find_replace ────────────────────────────────────────────────────
   server.registerTool(
     "sheets_find_replace",
     {
@@ -366,12 +539,116 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
       });
       const fr = res.data.replies?.[0]?.findReplace ?? {};
       return ok({
-        summary: `🔄 Replaced "${find}" → "${replace}" — ${fr.occurrencesChanged ?? 0} occurrence(s)${sheetId !== undefined ? ` (sheet ${sheetId})` : " (all sheets)"}`,
+        summary: `Replaced "${find}" -> "${replace}" — ${fr.occurrencesChanged ?? 0} occurrence(s)${sheetId !== undefined ? ` (sheet ${sheetId})` : " (all sheets)"}`,
         findReplace: fr,
       });
     }),
   );
 
+  // ── sheets_format_range ────────────────────────────────────────────────────
+  server.registerTool(
+    "sheets_format_range",
+    {
+      title: "Format a range",
+      description:
+        "Apply common cell formatting to one or more A1 ranges without hand-writing batchUpdate JSON: " +
+        "bold/italic, font size, text & background colour (#RRGGBB), alignment, number format, text wrap. " +
+        "Pass only the options you want to change. Items run sequentially.",
+      inputSchema: {
+        account,
+        items: z
+          .array(
+            z.object({
+              spreadsheetId: z.string(),
+              range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:C1'. Whole sheet if only a tab name."),
+              bold: z.boolean().optional(),
+              italic: z.boolean().optional(),
+              fontSize: z.number().int().min(1).max(400).optional(),
+              textColor: z.string().optional().describe("#RRGGBB"),
+              backgroundColor: z.string().optional().describe("#RRGGBB"),
+              horizontalAlignment: z.enum(["LEFT", "CENTER", "RIGHT"]).optional(),
+              verticalAlignment: z.enum(["TOP", "MIDDLE", "BOTTOM"]).optional(),
+              wrapStrategy: z.enum(["OVERFLOW_CELL", "CLIP", "WRAP"]).optional(),
+              numberFormatType: z
+                .enum(["NUMBER", "CURRENCY", "PERCENT", "DATE", "TIME", "DATE_TIME", "TEXT", "SCIENTIFIC"])
+                .optional(),
+              numberFormatPattern: z
+                .string()
+                .optional()
+                .describe("e.g. '#,##0.00', '0.0%', 'dd.mm.yyyy', '$#,##0'."),
+            }),
+          )
+          .min(1),
+      },
+    },
+    guard(async ({ account, items }) => {
+      const g = clients.resolve(account);
+      const results: Array<{ spreadsheetId: string; range: string; applied?: number; error?: string }> = [];
+
+      for (const item of items) {
+        const {
+          spreadsheetId, range, bold, italic, fontSize, textColor,
+          backgroundColor, horizontalAlignment, verticalAlignment, wrapStrategy,
+          numberFormatType, numberFormatPattern,
+        } = item;
+        try {
+          const fmt: sheets_v4.Schema$CellFormat = {};
+          const fields: string[] = [];
+          const textFormat: sheets_v4.Schema$TextFormat = {};
+          if (bold !== undefined) { textFormat.bold = bold; fields.push("userEnteredFormat.textFormat.bold"); }
+          if (italic !== undefined) { textFormat.italic = italic; fields.push("userEnteredFormat.textFormat.italic"); }
+          if (fontSize !== undefined) { textFormat.fontSize = fontSize; fields.push("userEnteredFormat.textFormat.fontSize"); }
+          if (textColor) { textFormat.foregroundColor = hexToColor(textColor); fields.push("userEnteredFormat.textFormat.foregroundColor"); }
+          if (Object.keys(textFormat).length) fmt.textFormat = textFormat;
+          if (backgroundColor) { fmt.backgroundColor = hexToColor(backgroundColor); fields.push("userEnteredFormat.backgroundColor"); }
+          if (horizontalAlignment) { fmt.horizontalAlignment = horizontalAlignment; fields.push("userEnteredFormat.horizontalAlignment"); }
+          if (verticalAlignment) { fmt.verticalAlignment = verticalAlignment; fields.push("userEnteredFormat.verticalAlignment"); }
+          if (wrapStrategy) { fmt.wrapStrategy = wrapStrategy; fields.push("userEnteredFormat.wrapStrategy"); }
+          if (numberFormatPattern || numberFormatType) {
+            fmt.numberFormat = { type: numberFormatType ?? "NUMBER", pattern: numberFormatPattern };
+            fields.push("userEnteredFormat.numberFormat");
+          }
+          if (!fields.length) {
+            results.push({ spreadsheetId, range, error: "No formatting options specified." });
+            continue;
+          }
+
+          const meta = await g.sheets.spreadsheets.get({
+            spreadsheetId,
+            fields: "sheets.properties(sheetId,title)",
+          });
+          const titleToId = new Map<string, number>();
+          for (const s of meta.data.sheets ?? []) {
+            if (s.properties?.title && typeof s.properties.sheetId === "number") {
+              titleToId.set(s.properties.title, s.properties.sheetId);
+            }
+          }
+          const firstSheetId = meta.data.sheets?.[0]?.properties?.sheetId ?? 0;
+          const gridRange = a1ToGridRange(range, titleToId, firstSheetId);
+
+          await g.sheets.spreadsheets.batchUpdate({
+            spreadsheetId,
+            requestBody: {
+              requests: [
+                { repeatCell: { range: gridRange, cell: { userEnteredFormat: fmt }, fields: fields.join(",") } },
+              ],
+            },
+          });
+          results.push({ spreadsheetId, range, applied: fields.length });
+        } catch (e: unknown) {
+          results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+        }
+      }
+
+      const ok_count = results.filter((r) => !r.error).length;
+      return ok({
+        summary: `Formatted ${ok_count}/${items.length} range(s)`,
+        results,
+      });
+    }),
+  );
+
+  // ── sheets_raw_batch_update ────────────────────────────────────────────────
   server.registerTool(
     "sheets_raw_batch_update",
     {
@@ -393,135 +670,119 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
         requestBody: { requests: requests as object[] },
       });
       return ok({
-        summary: `⚙️ Applied ${requests.length} raw request(s) to spreadsheet`,
+        summary: `Applied ${requests.length} raw request(s) to spreadsheet`,
         spreadsheetId: res.data.spreadsheetId,
         replies: res.data.replies,
       });
     }),
   );
 
+  // ── Read formatting ────────────────────────────────────────────────────────
+
   server.registerTool(
-    "sheets_batch_write",
+    "sheets_get_formatting",
     {
-      title: "Write several ranges at once",
+      title: "Get cell formatting",
       description:
-        "Write multiple non-contiguous ranges in one call. Each item is { range, values } (2D array). " +
-        "More efficient than several sheets_write_range calls.",
+        "Read cell formatting (fill colour, font, borders, number format, alignment, text style) " +
+        "for one or more ranges. Returns a human-readable summary per cell plus the raw " +
+        "userEnteredFormat object for precise values.",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
-        data: z
+        items: z
           .array(
             z.object({
-              range: z.string().describe("A1 notation, e.g. 'Sheet1!A1' or 'Sheet1!B2:C3'."),
-              values: z.array(
-                z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])),
-              ),
+              spreadsheetId: z.string(),
+              range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:C3'."),
             }),
           )
           .min(1),
-        valueInputOption: z.enum(["USER_ENTERED", "RAW"]).default("USER_ENTERED").optional(),
       },
+      annotations: { readOnlyHint: true },
     },
-    guard(async ({ account, spreadsheetId, data, valueInputOption }) => {
-      const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          valueInputOption: valueInputOption ?? "USER_ENTERED",
-          data: data.map((d) => ({ range: d.range, values: d.values })),
-        },
-      });
-      const totalCells = data.reduce((n, d) => n + d.values.reduce((m, row) => m + row.length, 0), 0);
-      return ok({
-        summary: `✏️ Wrote ${data.length} range(s), ${totalCells} cell(s) total`,
-        totalUpdatedCells: res.data.totalUpdatedCells,
-        totalUpdatedRows: res.data.totalUpdatedRows,
-        responses: res.data.responses?.map((r) => r.updatedRange),
-      });
-    }),
-  );
-
-  server.registerTool(
-    "sheets_format_range",
-    {
-      title: "Format a range",
-      description:
-        "Apply common cell formatting to an A1 range without hand-writing batchUpdate JSON: " +
-        "bold/italic, font size, text & background colour (#RRGGBB), alignment, number format, text wrap. " +
-        "Pass only the options you want to change.",
-      inputSchema: {
-        account,
-        spreadsheetId: z.string(),
-        range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:C1'. Whole sheet if only a tab name."),
-        bold: z.boolean().optional(),
-        italic: z.boolean().optional(),
-        fontSize: z.number().int().min(1).max(400).optional(),
-        textColor: z.string().optional().describe("#RRGGBB"),
-        backgroundColor: z.string().optional().describe("#RRGGBB"),
-        horizontalAlignment: z.enum(["LEFT", "CENTER", "RIGHT"]).optional(),
-        verticalAlignment: z.enum(["TOP", "MIDDLE", "BOTTOM"]).optional(),
-        wrapStrategy: z.enum(["OVERFLOW_CELL", "CLIP", "WRAP"]).optional(),
-        numberFormatType: z
-          .enum(["NUMBER", "CURRENCY", "PERCENT", "DATE", "TIME", "DATE_TIME", "TEXT", "SCIENTIFIC"])
-          .optional(),
-        numberFormatPattern: z
-          .string()
-          .optional()
-          .describe("e.g. '#,##0.00', '0.0%', 'dd.mm.yyyy', '$#,##0'."),
-      },
-    },
-    guard(async (args) => {
-      const {
-        account, spreadsheetId, range, bold, italic, fontSize, textColor,
-        backgroundColor, horizontalAlignment, verticalAlignment, wrapStrategy,
-        numberFormatType, numberFormatPattern,
-      } = args;
+    guard(async ({ account, items }) => {
       const g = clients.resolve(account);
 
-      const fmt: sheets_v4.Schema$CellFormat = {};
-      const fields: string[] = [];
-      const textFormat: sheets_v4.Schema$TextFormat = {};
-      if (bold !== undefined) { textFormat.bold = bold; fields.push("userEnteredFormat.textFormat.bold"); }
-      if (italic !== undefined) { textFormat.italic = italic; fields.push("userEnteredFormat.textFormat.italic"); }
-      if (fontSize !== undefined) { textFormat.fontSize = fontSize; fields.push("userEnteredFormat.textFormat.fontSize"); }
-      if (textColor) { textFormat.foregroundColor = hexToColor(textColor); fields.push("userEnteredFormat.textFormat.foregroundColor"); }
-      if (Object.keys(textFormat).length) fmt.textFormat = textFormat;
-      if (backgroundColor) { fmt.backgroundColor = hexToColor(backgroundColor); fields.push("userEnteredFormat.backgroundColor"); }
-      if (horizontalAlignment) { fmt.horizontalAlignment = horizontalAlignment; fields.push("userEnteredFormat.horizontalAlignment"); }
-      if (verticalAlignment) { fmt.verticalAlignment = verticalAlignment; fields.push("userEnteredFormat.verticalAlignment"); }
-      if (wrapStrategy) { fmt.wrapStrategy = wrapStrategy; fields.push("userEnteredFormat.wrapStrategy"); }
-      if (numberFormatPattern || numberFormatType) {
-        fmt.numberFormat = { type: numberFormatType ?? "NUMBER", pattern: numberFormatPattern };
-        fields.push("userEnteredFormat.numberFormat");
+      /** Converts a Sheets API Color object → "#RRGGBB" string or null. */
+      function colorToHex(c?: sheets_v4.Schema$Color | null): string | null {
+        if (!c) return null;
+        const r = Math.round((c.red ?? 0) * 255);
+        const gr = Math.round((c.green ?? 0) * 255);
+        const b = Math.round((c.blue ?? 0) * 255);
+        if (r === 0 && gr === 0 && b === 0) return null; // default / transparent
+        return `#${r.toString(16).padStart(2, "0")}${gr.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
       }
-      if (!fields.length) return fail("Specify at least one formatting option.");
 
-      const meta = await g.sheets.spreadsheets.get({
-        spreadsheetId,
-        fields: "sheets.properties(sheetId,title)",
-      });
-      const titleToId = new Map<string, number>();
-      for (const s of meta.data.sheets ?? []) {
-        if (s.properties?.title && typeof s.properties.sheetId === "number") {
-          titleToId.set(s.properties.title, s.properties.sheetId);
-        }
+      function summariseFormat(fmt?: sheets_v4.Schema$CellFormat | null) {
+        if (!fmt) return null;
+        const tf = fmt.textFormat;
+        return {
+          backgroundColor: colorToHex(fmt.backgroundColor),
+          textColor: colorToHex(tf?.foregroundColor),
+          bold: tf?.bold ?? false,
+          italic: tf?.italic ?? false,
+          strikethrough: tf?.strikethrough ?? false,
+          underline: tf?.underline ?? false,
+          fontSize: tf?.fontSize ?? null,
+          fontFamily: tf?.fontFamily ?? null,
+          horizontalAlignment: fmt.horizontalAlignment ?? null,
+          verticalAlignment: fmt.verticalAlignment ?? null,
+          wrapStrategy: fmt.wrapStrategy ?? null,
+          numberFormat: fmt.numberFormat
+            ? { type: fmt.numberFormat.type, pattern: fmt.numberFormat.pattern }
+            : null,
+          borders: fmt.borders
+            ? {
+                top: fmt.borders.top?.style ?? null,
+                bottom: fmt.borders.bottom?.style ?? null,
+                left: fmt.borders.left?.style ?? null,
+                right: fmt.borders.right?.style ?? null,
+              }
+            : null,
+        };
       }
-      const firstSheetId = meta.data.sheets?.[0]?.properties?.sheetId ?? 0;
-      const gridRange = a1ToGridRange(range, titleToId, firstSheetId);
 
-      await g.sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [
-            { repeatCell: { range: gridRange, cell: { userEnteredFormat: fmt }, fields: fields.join(",") } },
-          ],
-        },
-      });
+      const results = await Promise.all(
+        items.map(async ({ spreadsheetId, range }) => {
+          try {
+            const res = await g.sheets.spreadsheets.get({
+              spreadsheetId,
+              ranges: [range],
+              includeGridData: true,
+              fields:
+                "sheets(data(rowData(values(userEnteredFormat,userEnteredValue,effectiveFormat)),startRow,startColumn))",
+            });
+
+            const rows: object[] = [];
+            for (const sheet of res.data.sheets ?? []) {
+              for (const gridData of sheet.data ?? []) {
+                const startRow = gridData.startRow ?? 0;
+                const startCol = gridData.startColumn ?? 0;
+                for (const [ri, rowData] of (gridData.rowData ?? []).entries()) {
+                  for (const [ci, cell] of (rowData.values ?? []).entries()) {
+                    const colLetter = String.fromCharCode(65 + startCol + ci);
+                    const cellAddr = `${colLetter}${startRow + ri + 1}`;
+                    rows.push({
+                      cell: cellAddr,
+                      value: cell.userEnteredValue ?? null,
+                      formatting: summariseFormat(cell.userEnteredFormat),
+                      effectiveFormatting: summariseFormat(cell.effectiveFormat),
+                    });
+                  }
+                }
+              }
+            }
+
+            return { spreadsheetId, range, cells: rows };
+          } catch (e: unknown) {
+            return { spreadsheetId, range, error: e instanceof Error ? e.message : String(e) };
+          }
+        }),
+      );
+
       return ok({
-        summary: `🎨 Applied ${fields.length} format(s) to ${range}`,
-        formatted: range,
-        applied: fields.length,
+        summary: `🎨 Formatting for ${items.length} range(s)`,
+        results,
       });
     }),
   );
