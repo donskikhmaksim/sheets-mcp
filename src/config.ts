@@ -87,6 +87,9 @@ function loadOnboarding(): OnboardingConfig {
     googleClientSecret &&
     hasEncKey
   );
+  console.error(
+    `[onboarding debug] databaseUrl=${!!databaseUrl} railwayDomain=${!!railwayDomain} publicBaseUrl=${!!publicBaseUrl} googleClientId=${!!googleClientId} googleClientSecret=${!!googleClientSecret} hasEncKey=${hasEncKey} enabled=${enabled}`,
+  );
   return {
     enabled,
     databaseUrl,
