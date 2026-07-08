@@ -206,21 +206,25 @@ for repo in "${REPOS[@]}"; do
       fi
     fi
     cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
-
-    echo "  Подключаю код..."
-    STEP_OUT=$(mktemp)
-    if ! railway service source connect --repo "donskikhmaksim/$repo" --branch main --service "$repo" --json >"$STEP_OUT" 2>&1; then
-      if grep -qi "already" "$STEP_OUT"; then
-        echo "  (источник уже был подключён раньше — это нормально)"
-      else
-        cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
-        fail "Не смог подключить GitHub-репозиторий для $repo." "$LOG"
-      fi
-    fi
-    cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
   else
     echo "  Сервис уже существует, обновляю переменные и передеплою."
   fi
+
+  # Подключаем источник ВСЕГДА, даже если сервис уже был — прошлая неудачная
+  # попытка могла создать пустой сервис и упасть до этого шага (например,
+  # из-за несовместимой версии Railway CLI). Без источника `redeploy` вечно
+  # будет отвечать "No deployment found for service", сколько ни повторяй.
+  echo "  Подключаю код..."
+  STEP_OUT=$(mktemp)
+  if ! railway service source connect --repo "donskikhmaksim/$repo" --branch main --service "$repo" --json >"$STEP_OUT" 2>&1; then
+    if grep -qi "already" "$STEP_OUT"; then
+      echo "  (источник уже был подключён раньше — это нормально)"
+    else
+      cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
+      fail "Не смог подключить GitHub-репозиторий для $repo." "$LOG"
+    fi
+  fi
+  cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
 
   KEY=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 64)
   echo "  Задаю переменные..."
