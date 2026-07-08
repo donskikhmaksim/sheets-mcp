@@ -89,33 +89,33 @@ echo "(Sheets, Docs, Drive, Gmail, Calendar) и подключит их к Claud
 echo "Займёт ~5-7 минут."
 
 # ── Шаг 1: Railway CLI ─────────────────────────────────────────────────────
-# Версия закреплена намеренно: команды этого скрипта проверены строго под
-# 5.17.0. Между версиями Railway CLI менялся синтаксис подкоманд
-# (например, `railway service source connect`) — "последняя версия" может
-# оказаться несовместимой.
-RAILWAY_PIN="5.17.0"
-step "1/4  Проверяю Railway CLI (нужна версия $RAILWAY_PIN)"
+# Нужен Railway CLI ≥ 5.17 (все команды скрипта работают одинаково на 5.17–5.24+).
+# Если railway уже установлен любой свежей версии — используем его как есть и
+# ничего не переустанавливаем (иначе npm падает с EEXIST поверх brew-бинарника).
+MIN_MAJOR=5
+step "1/4  Проверяю Railway CLI"
 
-CURRENT_VERSION=$(railway --version 2>/dev/null | awk '{print $2}')
-
-if [[ "$CURRENT_VERSION" != "$RAILWAY_PIN" ]]; then
-  echo "Устанавливаю Railway CLI $RAILWAY_PIN..."
-  if command -v npm &>/dev/null; then
-    npm install -g "@railway/cli@$RAILWAY_PIN" >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI через npm." "$LOG"
-  elif command -v brew &>/dev/null; then
-    echo "  npm не найден — ставлю через brew (может подтянуться другая версия)."
-    brew install railway >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI через brew." "$LOG"
+if command -v railway &>/dev/null; then
+  CURRENT_VERSION=$(railway --version 2>/dev/null | awk '{print $2}')
+  MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+  if [[ -n "$MAJOR" && "$MAJOR" -ge "$MIN_MAJOR" ]]; then
+    : # подходящая версия уже стоит — ничего не делаем
   else
-    echo "  Ни npm, ни brew не найдены — ставлю через официальный установщик."
+    echo -e "${YELLOW}⚠️  Установлена старая версия Railway CLI ($CURRENT_VERSION). Обнови её:${RESET}"
+    echo "   brew upgrade railway   (или npm i -g @railway/cli@latest), затем запусти команду снова."
+    fail "Нужен Railway CLI версии ${MIN_MAJOR}.x или новее." "$LOG"
+  fi
+else
+  echo "Railway CLI не найден — устанавливаю..."
+  if command -v brew &>/dev/null; then
+    brew install railway >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI через brew." "$LOG"
+  elif command -v npm &>/dev/null; then
+    npm install -g @railway/cli >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI через npm." "$LOG"
+  else
     curl -fsSL https://railway.app/install.sh | sh >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI." "$LOG"
     export PATH="$HOME/.railway/bin:$PATH"
   fi
-fi
-
-FINAL_VERSION=$(railway --version 2>/dev/null | awk '{print $2}')
-if [[ "$FINAL_VERSION" != "$RAILWAY_PIN" ]]; then
-  echo -e "${YELLOW}⚠️  Установилась версия $FINAL_VERSION вместо $RAILWAY_PIN.${RESET}"
-  echo "   Если дальше что-то пойдёт не так — вероятно, дело в этом несовпадении."
+  command -v railway &>/dev/null || fail "Railway CLI не установился." "$LOG"
 fi
 ok "Railway CLI $(railway --version 2>&1 | head -1)"
 
