@@ -64,7 +64,7 @@ fail() {
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 
-clear
+clear 2>/dev/null || true
 echo -e "${BOLD}╔══════════════════════════════════════════╗"
 echo -e "║   Google MCP — установка                 ║"
 echo -e "╚══════════════════════════════════════════╝${RESET}"
@@ -116,11 +116,20 @@ EXISTING_PROJECT_ID=$(railway list --json 2>>"$LOG" \
   | head -1 \
   | sed -E 's/.*"id": *"([^"]+)".*/\1/' || true)
 
+LINKED=false
 if [[ -n "$EXISTING_PROJECT_ID" ]]; then
   echo "Нашёл существующий проект, переиспользую его..."
-  railway link --project "$EXISTING_PROJECT_ID" --environment production --json >>"$LOG" 2>&1 \
-    || fail "Не смог подключиться к существующему проекту $PROJECT_NAME." "$LOG"
-else
+  if railway link --project "$EXISTING_PROJECT_ID" --environment production --json >>"$LOG" 2>&1; then
+    LINKED=true
+  else
+    # Проект мог быть удалён вручную — Railway иногда ещё пару секунд
+    # показывает его в списке (устаревший кэш). В этом случае просто
+    # создаём новый, а не падаем.
+    echo "  Похоже, этот проект уже удалён — создаю новый."
+  fi
+fi
+
+if [[ "$LINKED" == false ]]; then
   echo "Создаю проект..."
   railway init --name "$PROJECT_NAME" --json >>"$LOG" 2>&1 || fail "Не смог создать проект на Railway." "$LOG"
 fi
