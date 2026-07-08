@@ -121,16 +121,21 @@ ok "Railway CLI $(railway --version 2>&1 | head -1)"
 
 # ── Шаг 2: Логин в Railway ─────────────────────────────────────────────────
 step "2/4  Войди в Railway"
-echo ""
-echo "Сейчас откроется браузер — войди в свой аккаунт Railway."
-echo "(Если аккаунта нет — создай на railway.app, это бесплатно)"
-echo ""
-ask "Нажми Enter чтобы открыть браузер..."
-read -r
-
-railway login
-
-ok "Авторизован в Railway"
+if railway whoami &>/dev/null; then
+  ok "Уже авторизован в Railway ($(railway whoami 2>/dev/null | tail -1))"
+else
+  echo ""
+  echo "Сейчас откроется браузер — войди в свой аккаунт Railway."
+  echo "(Если аккаунта нет — создай на railway.app, это бесплатно)"
+  echo ""
+  # В неинтерактивном запуске (нет терминала) пропускаем паузу.
+  if [[ -t 0 ]]; then
+    ask "Нажми Enter чтобы открыть браузер..."
+    read -r
+  fi
+  railway login || fail "Не удалось войти в Railway." "$LOG"
+  ok "Авторизован в Railway"
+fi
 
 # ── Шаг 3: Деплой ───────────────────────────────────────────────────────────
 step "3/4  Деплою серверы (это самая долгая часть, ~3-5 минут)"
