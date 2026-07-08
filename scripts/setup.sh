@@ -57,12 +57,16 @@ fail() {
   if [[ -n "$2" && -f "$2" ]]; then
     echo "--- подробности ---" >&2
     tail -20 "$2" >&2
+    echo "" >&2
+    echo -e "${YELLOW}Полный лог сохранён в: $2${RESET}" >&2
+    echo "Если пишешь тому, кто прислал скрипт — пришли этот файл целиком," >&2
+    echo "а не текст из терминала (он часто обрезается при копировании)." >&2
   fi
   exit 1
 }
 
-LOG=$(mktemp)
-trap 'rm -f "$LOG"' EXIT
+LOG="$HOME/google-mcp-setup.log"
+: > "$LOG"  # обнуляем лог этого запуска, но файл не удаляем — пригодится для диагностики
 
 clear 2>/dev/null || true
 echo -e "${BOLD}╔══════════════════════════════════════════╗"
@@ -74,16 +78,33 @@ echo "(Sheets, Docs, Drive, Gmail, Calendar) и подключит их к Claud
 echo "Займёт ~5-7 минут."
 
 # ── Шаг 1: Railway CLI ─────────────────────────────────────────────────────
-step "1/4  Проверяю Railway CLI"
+# Версия закреплена намеренно: команды этого скрипта проверены строго под
+# 5.17.0. Между версиями Railway CLI менялся синтаксис подкоманд
+# (например, `railway service source connect`) — "последняя версия" может
+# оказаться несовместимой.
+RAILWAY_PIN="5.17.0"
+step "1/4  Проверяю Railway CLI (нужна версия $RAILWAY_PIN)"
 
-if ! command -v railway &>/dev/null; then
-  echo "Устанавливаю Railway CLI..."
-  if command -v brew &>/dev/null; then
-    brew install railway
+CURRENT_VERSION=$(railway --version 2>/dev/null | awk '{print $2}')
+
+if [[ "$CURRENT_VERSION" != "$RAILWAY_PIN" ]]; then
+  echo "Устанавливаю Railway CLI $RAILWAY_PIN..."
+  if command -v npm &>/dev/null; then
+    npm install -g "@railway/cli@$RAILWAY_PIN" >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI через npm." "$LOG"
+  elif command -v brew &>/dev/null; then
+    echo "  npm не найден — ставлю через brew (может подтянуться другая версия)."
+    brew install railway >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI через brew." "$LOG"
   else
-    curl -fsSL https://railway.app/install.sh | sh
+    echo "  Ни npm, ни brew не найдены — ставлю через официальный установщик."
+    curl -fsSL https://railway.app/install.sh | sh >>"$LOG" 2>&1 || fail "Не смог установить Railway CLI." "$LOG"
     export PATH="$HOME/.railway/bin:$PATH"
   fi
+fi
+
+FINAL_VERSION=$(railway --version 2>/dev/null | awk '{print $2}')
+if [[ "$FINAL_VERSION" != "$RAILWAY_PIN" ]]; then
+  echo -e "${YELLOW}⚠️  Установилась версия $FINAL_VERSION вместо $RAILWAY_PIN.${RESET}"
+  echo "   Если дальше что-то пойдёт не так — вероятно, дело в этом несовпадении."
 fi
 ok "Railway CLI $(railway --version 2>&1 | head -1)"
 
