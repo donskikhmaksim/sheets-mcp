@@ -196,11 +196,28 @@ for repo in "${REPOS[@]}"; do
 
   if [[ "$ALREADY_EXISTS" -eq 0 ]]; then
     echo "  Создаю сервис..."
-    railway add --service "$repo" --json >>"$LOG" 2>&1 || fail "Не смог создать сервис $repo." "$LOG"
+    STEP_OUT=$(mktemp)
+    if ! railway add --service "$repo" --json >"$STEP_OUT" 2>&1; then
+      if grep -qi "already exists" "$STEP_OUT"; then
+        echo "  (сервис уже был создан раньше — это нормально при повторном запуске)"
+      else
+        cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
+        fail "Не смог создать сервис $repo." "$LOG"
+      fi
+    fi
+    cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
 
     echo "  Подключаю код..."
-    railway service source connect --repo "donskikhmaksim/$repo" --branch main --service "$repo" --json >>"$LOG" 2>&1 \
-      || fail "Не смог подключить GitHub-репозиторий для $repo." "$LOG"
+    STEP_OUT=$(mktemp)
+    if ! railway service source connect --repo "donskikhmaksim/$repo" --branch main --service "$repo" --json >"$STEP_OUT" 2>&1; then
+      if grep -qi "already" "$STEP_OUT"; then
+        echo "  (источник уже был подключён раньше — это нормально)"
+      else
+        cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
+        fail "Не смог подключить GitHub-репозиторий для $repo." "$LOG"
+      fi
+    fi
+    cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
   else
     echo "  Сервис уже существует, обновляю переменные и передеплою."
   fi
