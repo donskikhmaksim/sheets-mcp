@@ -13,23 +13,34 @@ set -e
 # ── Парсинг аргументов ─────────────────────────────────────────────────────
 CLIENT_ID=""
 CLIENT_SECRET=""
+RELAY_SECRET=""
+# Общий OAuth-релей: держит единственный redirect_uri, зарегистрированный в
+# Google один раз навсегда. Он token-blind — токенов не видит, только пересылает
+# одноразовый код на твой сервер. Домен по умолчанию можно переопределить.
+RELAY_URL="https://maksims-mac-mini.taild91c23.ts.net"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --client-id)     CLIENT_ID="$2";     shift 2 ;;
     --client-secret) CLIENT_SECRET="$2"; shift 2 ;;
+    --relay-secret)  RELAY_SECRET="$2";  shift 2 ;;
+    --relay-url)     RELAY_URL="$2";     shift 2 ;;
     *) shift ;;
   esac
 done
 
-if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" ]]; then
-  echo "❌ Скрипт должен быть запущен с ключами --client-id и --client-secret"
+if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" || -z "$RELAY_SECRET" ]]; then
+  echo "❌ Скрипт должен быть запущен с ключами --client-id, --client-secret и --relay-secret"
   echo "   Получи персональную команду у того, кто тебе прислал эту инструкцию."
   exit 1
 fi
 
 PROJECT_NAME="google-mcp"
 REPOS=(sheets-mcp docs-mcp drive-mcp gmail-mcp calendar-mcp)
+
+# Один секрет дашборда на все 5 сервисов человека (они делят одну базу, так что
+# аккаунт добавляется один раз и виден всем). Ссылка вида /dashboard/<секрет>.
+DASHBOARD_SECRET=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
 
 label_for() {
   case "$1" in
@@ -236,6 +247,12 @@ for repo in "${REPOS[@]}"; do
     || fail "Не смог задать ONBOARDING_GOOGLE_CLIENT_ID для $repo." "$LOG"
   railway variable set "ONBOARDING_GOOGLE_CLIENT_SECRET=$CLIENT_SECRET" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
     || fail "Не смог задать ONBOARDING_GOOGLE_CLIENT_SECRET для $repo." "$LOG"
+  railway variable set "OAUTH_RELAY_URL=$RELAY_URL" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
+    || fail "Не смог задать OAUTH_RELAY_URL для $repo." "$LOG"
+  railway variable set "OAUTH_RELAY_SECRET=$RELAY_SECRET" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
+    || fail "Не смог задать OAUTH_RELAY_SECRET для $repo." "$LOG"
+  railway variable set "DASHBOARD_SECRET=$DASHBOARD_SECRET" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
+    || fail "Не смог задать DASHBOARD_SECRET для $repo." "$LOG"
 
   echo "  Генерирую домен..."
   DOMAIN_JSON=$(railway domain --service "$repo" --json 2>>"$LOG") || fail "Не смог создать домен для $repo." "$LOG"
@@ -300,5 +317,13 @@ echo "  нажми Advanced → Go to ... (unsafe) → Allow."
 echo ""
 echo -e "${BOLD}Важно:${RESET} логиниться в Google нужно только один раз — при первом"
 echo "подключённом сервисе. Остальные 4 подхватят тот же аккаунт сами."
+echo ""
+echo -e "${BOLD}Несколько почт?${RESET} Открой свой дашборд и жми «Добавить аккаунт»:"
+echo ""
+echo -e "  ${CYAN}https://${DOMAINS[0]}/dashboard/${DASHBOARD_SECRET}${RESET}"
+echo ""
+echo "  Там можно подключить несколько своих Google-аккаунтов, дать им метки"
+echo "  (например personal / work) и выбрать основной. В Claude переключайся"
+echo "  между ними параметром account. Токены хранятся только на твоём сервере."
 echo ""
 echo -e "${BOLD}Проверка:${RESET} напиши Claude «Покажи мои файлы на Google Диске»"
