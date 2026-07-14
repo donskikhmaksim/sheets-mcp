@@ -72,6 +72,71 @@ export function a1ToGridRange(
   };
 }
 
+/** 0-based column index → letters (0→A, 25→Z, 26→AA). Handles columns past Z. */
+export function colIndexToLetters(index: number): string {
+  let n = index + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/** Sheets API Color → "#RRGGBB" string, or null for unset/pure-black. */
+function colorToHex(c?: sheets_v4.Schema$Color | null): string | null {
+  if (!c) return null;
+  const r = Math.round((c.red ?? 0) * 255);
+  const gr = Math.round((c.green ?? 0) * 255);
+  const b = Math.round((c.blue ?? 0) * 255);
+  if (r === 0 && gr === 0 && b === 0) return null; // default / transparent
+  return `#${r.toString(16).padStart(2, "0")}${gr.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
+}
+
+/** Compact, human-readable summary of a cell's CellFormat. */
+function summariseFormat(fmt?: sheets_v4.Schema$CellFormat | null) {
+  if (!fmt) return null;
+  const tf = fmt.textFormat;
+  return {
+    backgroundColor: colorToHex(fmt.backgroundColor),
+    textColor: colorToHex(tf?.foregroundColor),
+    bold: tf?.bold ?? false,
+    italic: tf?.italic ?? false,
+    strikethrough: tf?.strikethrough ?? false,
+    underline: tf?.underline ?? false,
+    fontSize: tf?.fontSize ?? null,
+    fontFamily: tf?.fontFamily ?? null,
+    horizontalAlignment: fmt.horizontalAlignment ?? null,
+    verticalAlignment: fmt.verticalAlignment ?? null,
+    wrapStrategy: fmt.wrapStrategy ?? null,
+    numberFormat: fmt.numberFormat
+      ? { type: fmt.numberFormat.type, pattern: fmt.numberFormat.pattern }
+      : null,
+    borders: fmt.borders
+      ? {
+          top: fmt.borders.top?.style ?? null,
+          bottom: fmt.borders.bottom?.style ?? null,
+          left: fmt.borders.left?.style ?? null,
+          right: fmt.borders.right?.style ?? null,
+        }
+      : null,
+  };
+}
+
+/** Best-effort display string for a cell, mirroring what the user sees. */
+function cellText(cell: sheets_v4.Schema$CellData): string | null {
+  if (cell.formattedValue != null) return cell.formattedValue;
+  const ev = cell.effectiveValue ?? cell.userEnteredValue;
+  if (!ev) return null;
+  if (ev.stringValue != null) return ev.stringValue;
+  if (ev.numberValue != null) return String(ev.numberValue);
+  if (ev.boolValue != null) return ev.boolValue ? "TRUE" : "FALSE";
+  if (ev.formulaValue != null) return ev.formulaValue;
+  if (ev.errorValue) return ev.errorValue.message ?? "#ERROR";
+  return null;
+}
+
 const cellValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const valuesField = z.array(z.array(cellValue)).describe("2D array of rows × columns.");
 const valueInputOptionField = z.enum(["USER_ENTERED", "RAW"]).default("USER_ENTERED").optional();
@@ -703,45 +768,6 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
 
-      /** Converts a Sheets API Color object → "#RRGGBB" string or null. */
-      function colorToHex(c?: sheets_v4.Schema$Color | null): string | null {
-        if (!c) return null;
-        const r = Math.round((c.red ?? 0) * 255);
-        const gr = Math.round((c.green ?? 0) * 255);
-        const b = Math.round((c.blue ?? 0) * 255);
-        if (r === 0 && gr === 0 && b === 0) return null; // default / transparent
-        return `#${r.toString(16).padStart(2, "0")}${gr.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
-      }
-
-      function summariseFormat(fmt?: sheets_v4.Schema$CellFormat | null) {
-        if (!fmt) return null;
-        const tf = fmt.textFormat;
-        return {
-          backgroundColor: colorToHex(fmt.backgroundColor),
-          textColor: colorToHex(tf?.foregroundColor),
-          bold: tf?.bold ?? false,
-          italic: tf?.italic ?? false,
-          strikethrough: tf?.strikethrough ?? false,
-          underline: tf?.underline ?? false,
-          fontSize: tf?.fontSize ?? null,
-          fontFamily: tf?.fontFamily ?? null,
-          horizontalAlignment: fmt.horizontalAlignment ?? null,
-          verticalAlignment: fmt.verticalAlignment ?? null,
-          wrapStrategy: fmt.wrapStrategy ?? null,
-          numberFormat: fmt.numberFormat
-            ? { type: fmt.numberFormat.type, pattern: fmt.numberFormat.pattern }
-            : null,
-          borders: fmt.borders
-            ? {
-                top: fmt.borders.top?.style ?? null,
-                bottom: fmt.borders.bottom?.style ?? null,
-                left: fmt.borders.left?.style ?? null,
-                right: fmt.borders.right?.style ?? null,
-              }
-            : null,
-        };
-      }
-
       const results = await Promise.all(
         items.map(async ({ spreadsheetId, range }) => {
           try {
@@ -760,7 +786,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
                 const startCol = gridData.startColumn ?? 0;
                 for (const [ri, rowData] of (gridData.rowData ?? []).entries()) {
                   for (const [ci, cell] of (rowData.values ?? []).entries()) {
-                    const colLetter = String.fromCharCode(65 + startCol + ci);
+                    const colLetter = colIndexToLetters(startCol + ci);
                     const cellAddr = `${colLetter}${startRow + ri + 1}`;
                     rows.push({
                       cell: cellAddr,
@@ -783,6 +809,118 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
       return ok({
         summary: `🎨 Formatting for ${items.length} range(s)`,
         results,
+      });
+    }),
+  );
+
+  // ── sheets_find ────────────────────────────────────────────────────────────
+  server.registerTool(
+    "sheets_find",
+    {
+      title: "Find cells (no replace)",
+      description:
+        "Search for text across a spreadsheet WITHOUT changing anything — a read-only alternative " +
+        "to sheets_find_replace for locating text and inspecting it. Returns every matching cell " +
+        "with its sheet/tab, A1 address, 1-based row, column letter + 1-based index, the cell value, " +
+        "and (optionally) its formatting. Supports case-sensitive, whole-cell, and regex matching, " +
+        "and can be scoped to a single tab or A1 range.",
+      inputSchema: {
+        account,
+        spreadsheetId: z.string(),
+        query: z.string().describe("Text to look for."),
+        matchCase: z.boolean().default(false).optional().describe("Case-sensitive match."),
+        matchEntireCell: z
+          .boolean()
+          .default(false)
+          .optional()
+          .describe("Match only cells whose entire value equals the query (like the Sheets UI 'Match entire cell contents'). Ignored when regex=true."),
+        regex: z
+          .boolean()
+          .default(false)
+          .optional()
+          .describe("Treat query as a JavaScript regular expression. Overrides matchEntireCell."),
+        sheetTitle: z.string().optional().describe("Restrict the search to one tab by name."),
+        range: z
+          .string()
+          .optional()
+          .describe("Restrict to an A1 range, e.g. 'Sheet1!A1:D100'. Overrides sheetTitle."),
+        includeFormatting: z
+          .boolean()
+          .default(false)
+          .optional()
+          .describe("Include each matching cell's formatting (fill, font, number format, borders, etc.)."),
+        maxResults: z.number().int().min(1).max(1000).default(200).optional(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ account, spreadsheetId, query, matchCase, matchEntireCell, regex, sheetTitle, range, includeFormatting, maxResults }) => {
+      const g = clients.resolve(account);
+      const cap = maxResults ?? 200;
+
+      // Build the matcher.
+      let re: RegExp | null = null;
+      if (regex) re = new RegExp(query, matchCase ? "" : "i");
+      const needle = matchCase ? query : query.toLowerCase();
+      const isMatch = (value: string): boolean => {
+        if (re) return re.test(value);
+        const hay = matchCase ? value : value.toLowerCase();
+        return matchEntireCell ? hay === needle : hay.includes(needle);
+      };
+
+      const ranges = range ? [range] : sheetTitle ? [sheetTitle] : undefined;
+      const fmtFields = includeFormatting ? ",userEnteredFormat,effectiveFormat" : "";
+      const res = await g.sheets.spreadsheets.get({
+        spreadsheetId,
+        ranges,
+        includeGridData: true,
+        fields: `spreadsheetUrl,sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(formattedValue,effectiveValue,userEnteredValue${fmtFields}))))`,
+      });
+
+      const found: Record<string, unknown>[] = [];
+      let truncated = false;
+      outer: for (const sheet of res.data.sheets ?? []) {
+        const tab = sheet.properties?.title ?? null;
+        const sheetId = sheet.properties?.sheetId ?? null;
+        for (const gd of sheet.data ?? []) {
+          const startRow = gd.startRow ?? 0;
+          const startCol = gd.startColumn ?? 0;
+          for (const [ri, rowData] of (gd.rowData ?? []).entries()) {
+            for (const [ci, cell] of (rowData.values ?? []).entries()) {
+              const value = cellText(cell);
+              if (value === null || value === "") continue;
+              if (!isMatch(value)) continue;
+              const rowNum = startRow + ri + 1;
+              const colIdx = startCol + ci;
+              const colLetter = colIndexToLetters(colIdx);
+              const entry: Record<string, unknown> = {
+                sheet: tab,
+                sheetId,
+                cell: `${colLetter}${rowNum}`,
+                row: rowNum,
+                column: colLetter,
+                columnIndex: colIdx + 1,
+                value,
+              };
+              if (includeFormatting) {
+                entry.formatting = summariseFormat(cell.userEnteredFormat);
+                entry.effectiveFormatting = summariseFormat(cell.effectiveFormat);
+              }
+              found.push(entry);
+              if (found.length >= cap) {
+                truncated = true;
+                break outer;
+              }
+            }
+          }
+        }
+      }
+
+      const scope = range ? ` in ${range}` : sheetTitle ? ` in tab "${sheetTitle}"` : "";
+      return ok({
+        summary: `Found ${found.length}${truncated ? "+ (capped)" : ""} match(es) for "${query}"${scope}`,
+        spreadsheetUrl: res.data.spreadsheetUrl,
+        truncated,
+        matches: found,
       });
     }),
   );
