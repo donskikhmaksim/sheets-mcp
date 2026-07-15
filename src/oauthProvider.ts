@@ -107,10 +107,24 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
     return `${payload}.${sig}`;
   }
 
-  private buildGoogleAuthUrl(nonce: string): string {
+  /**
+   * `forceConsent` controls Google's `prompt`, and the two flows need opposite
+   * things:
+   *   - Connecting an MCP client: omit it. Google then skips the consent screen
+   *     once the grant exists, so linking the 2nd..Nth server is a silent
+   *     redirect. It still round-trips through Google, so the caller is still
+   *     proving who they are — only the click goes away. Google only returns a
+   *     refresh token on the *first* grant, so handleGoogleCallback falls back
+   *     to the stored one.
+   *   - Adding another account from the dashboard: force it. Without a chooser
+   *     Google silently re-picks the already-linked account, making a second
+   *     account impossible to add; `consent` also guarantees a refresh token for
+   *     the newly picked account, which is one we have never seen before.
+   */
+  private buildGoogleAuthUrl(nonce: string, forceConsent: boolean): string {
     return this.googleClient().generateAuthUrl({
       access_type: "offline",
-      prompt: "consent",
+      ...(forceConsent ? { prompt: "select_account consent" } : {}),
       scope: GOOGLE_SCOPES,
       state: this.buildState(nonce),
     });
@@ -129,7 +143,7 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
       resource: params.resource?.toString(),
       mode: "mcp",
     });
-    res.redirect(this.buildGoogleAuthUrl(nonce));
+    res.redirect(this.buildGoogleAuthUrl(nonce, false));
   }
 
   /**
@@ -149,7 +163,7 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
       resource: undefined,
       mode: "dashboard",
     });
-    return this.buildGoogleAuthUrl(nonce);
+    return this.buildGoogleAuthUrl(nonce, true);
   }
 
   /** Step 2: Google (via the relay) redirects to /oauth/google/callback -> here. */
@@ -159,15 +173,25 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
 
     const oauth = this.googleClient();
     const { tokens } = await oauth.getToken(code);
-    if (!tokens.refresh_token) {
-      throw new Error(
-        "Google did not return a refresh token. Revoke this app's access at https://myaccount.google.com/permissions and try again.",
-      );
-    }
     oauth.setCredentials(tokens);
     const oauth2 = google.oauth2({ version: "v2", auth: oauth });
     const { data } = await oauth2.userinfo.get();
-    const account = await store.addGoogleAccount(data.email ?? "unknown", tokens.refresh_token);
+    const email = data.email ?? "unknown";
+
+    // Google only issues a refresh token on the first grant, and the MCP connect
+    // flow deliberately no longer forces a re-consent. Reuse the stored token for
+    // this email: userinfo above came from a token Google just minted, so the
+    // account is verified — we are not handing out anything the caller has not
+    // just proved they own.
+    let refreshToken = tokens.refresh_token ?? undefined;
+    if (!refreshToken) refreshToken = await store.getRefreshTokenByEmail(email);
+    if (!refreshToken) {
+      throw new Error(
+        `Google did not return a refresh token for ${email} and none is stored. ` +
+          "Revoke this app's access at https://myaccount.google.com/permissions and try again.",
+      );
+    }
+    const account = await store.addGoogleAccount(email, refreshToken);
 
     // Add-account flow: return straight to the dashboard, no MCP code minted.
     if (pending.mode === "dashboard") {
