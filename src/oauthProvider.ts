@@ -108,23 +108,28 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
   }
 
   /**
-   * `forceConsent` controls Google's `prompt`, and the two flows need opposite
-   * things:
-   *   - Connecting an MCP client: omit it. Google then skips the consent screen
-   *     once the grant exists, so linking the 2nd..Nth server is a silent
-   *     redirect. It still round-trips through Google, so the caller is still
-   *     proving who they are — only the click goes away. Google only returns a
-   *     refresh token on the *first* grant, so handleGoogleCallback falls back
-   *     to the stored one.
-   *   - Adding another account from the dashboard: force it. Without a chooser
-   *     Google silently re-picks the already-linked account, making a second
-   *     account impossible to add; `consent` also guarantees a refresh token for
-   *     the newly picked account, which is one we have never seen before.
+   * The two flows want opposite things from Google's `prompt`:
+   *   - Connecting an MCP client, account already linked: omit `prompt` and pass
+   *     `loginHint`. Google then skips both the account chooser and the consent
+   *     screen, so linking the 2nd..Nth server is a silent redirect. Without the
+   *     hint Google cannot tell which signed-in account to use and asks anyway,
+   *     which defeats the point. It still round-trips through Google, so the
+   *     caller keeps proving who they are — only the clicks go away. Google only
+   *     returns a refresh token on the *first* grant, so handleGoogleCallback
+   *     falls back to the stored one.
+   *   - Nothing linked yet, or adding another account from the dashboard: force
+   *     `select_account consent`. The chooser is the only way to reach an
+   *     account we have not seen, and `consent` is what guarantees the refresh
+   *     token that account still needs.
    */
-  private buildGoogleAuthUrl(nonce: string, forceConsent: boolean): string {
+  private buildGoogleAuthUrl(
+    nonce: string,
+    opts: { forceConsent: boolean; loginHint?: string },
+  ): string {
     return this.googleClient().generateAuthUrl({
       access_type: "offline",
-      ...(forceConsent ? { prompt: "select_account consent" } : {}),
+      ...(opts.forceConsent ? { prompt: "select_account consent" } : {}),
+      ...(opts.loginHint ? { login_hint: opts.loginHint } : {}),
       scope: GOOGLE_SCOPES,
       state: this.buildState(nonce),
     });
@@ -143,7 +148,14 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
       resource: params.resource?.toString(),
       mode: "mcp",
     });
-    res.redirect(this.buildGoogleAuthUrl(nonce, false));
+    // Hint the account we already hold a token for, so Google can skip straight
+    // through. With nothing linked yet there is nothing to hint and the user has
+    // to pick and consent for real.
+    const linked = await store.listGoogleAccounts();
+    const primary = linked[0];
+    res.redirect(
+      this.buildGoogleAuthUrl(nonce, { forceConsent: !primary, loginHint: primary?.email }),
+    );
   }
 
   /**
@@ -163,7 +175,7 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
       resource: undefined,
       mode: "dashboard",
     });
-    return this.buildGoogleAuthUrl(nonce, true);
+    return this.buildGoogleAuthUrl(nonce, { forceConsent: true });
   }
 
   /** Step 2: Google (via the relay) redirects to /oauth/google/callback -> here. */
