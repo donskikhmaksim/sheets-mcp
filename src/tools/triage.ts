@@ -38,7 +38,11 @@ async function readAllRows(g: ReturnType<UserClients["resolve"]>): Promise<strin
 }
 
 export function registerTriageTools(server: McpServer, userClients: UserClients) {
-  const ACCOUNT = "personal";
+  // Use whatever account this instance actually has (the onboarded default),
+  // not a hardcoded name — a stale label like "personal" no longer exists and
+  // broke logging with "Unknown account". This value is both resolved to a
+  // Google client and written into the sheet's "Account" column.
+  const ACCOUNT = userClients.defaultName;
 
   // ── triage_log_add ─────────────────────────────────────────────────────────
   server.registerTool(
