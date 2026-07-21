@@ -17,7 +17,7 @@ RELAY_SECRET=""
 # Общий OAuth-релей: держит единственный redirect_uri, зарегистрированный в
 # Google один раз навсегда. Он token-blind — токенов не видит, только пересылает
 # одноразовый код на твой сервер. Домен по умолчанию можно переопределить.
-RELAY_URL="https://maksims-mac-mini.taild91c23.ts.net"
+RELAY_URL="https://relay.fix-roll.com"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
