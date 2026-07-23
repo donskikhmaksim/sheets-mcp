@@ -201,6 +201,26 @@ redeploy_with_retry() {
   done
 }
 
+# ── Единый ключ шифрования токенов на весь проект ───────────────────────────
+# Все 5 сервисов делят ОДНУ базу и расшифровывают refresh-токены друг друга
+# ОДНИМ И ТЕМ ЖЕ ключом (google_accounts.ref_enc). Поэтому ключ — один на весь
+# проект, а не по сервису. При повторном запуске переиспользуем уже заданный
+# ключ: иначе ранее сохранённые токены (Google-логины) станут нечитаемы и всех
+# разлогинит. Ищем существующий ключ в любом из уже развёрнутых сервисов.
+TOKEN_ENC_KEY=""
+for repo in "${REPOS[@]}"; do
+  EXISTING_KEY=$(railway variable list --service "$repo" --kv 2>>"$LOG" \
+    | grep '^TOKEN_ENC_KEY=' | head -1 | cut -d= -f2- || true)
+  if [[ -n "$EXISTING_KEY" ]]; then
+    TOKEN_ENC_KEY="$EXISTING_KEY"
+    echo "Нашёл уже заданный ключ шифрования токенов — переиспользую (логины сохранятся)."
+    break
+  fi
+done
+if [[ -z "$TOKEN_ENC_KEY" ]]; then
+  TOKEN_ENC_KEY=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 64)
+fi
+
 DOMAINS=()
 
 for repo in "${REPOS[@]}"; do
@@ -242,11 +262,10 @@ for repo in "${REPOS[@]}"; do
   fi
   cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
 
-  KEY=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 64)
   echo "  Задаю переменные..."
   railway variable set "DATABASE_URL=\${{Postgres.DATABASE_URL}}" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
     || fail "Не смог задать DATABASE_URL для $repo." "$LOG"
-  railway variable set "TOKEN_ENC_KEY=$KEY" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
+  railway variable set "TOKEN_ENC_KEY=$TOKEN_ENC_KEY" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
     || fail "Не смог задать TOKEN_ENC_KEY для $repo." "$LOG"
   railway variable set "ONBOARDING_GOOGLE_CLIENT_ID=$CLIENT_ID" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
     || fail "Не смог задать ONBOARDING_GOOGLE_CLIENT_ID для $repo." "$LOG"
