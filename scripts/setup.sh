@@ -249,22 +249,36 @@ else
   echo "База данных уже есть, пропускаю."
 fi
 
-# Ждёт пока деплой сервиса перестанет быть "в процессе", затем запускает
-# явный редеплой. Обходит гонку: service source connect сам запускает сборку,
-# и если она ещё не закончилась, обычный `railway redeploy` падает с
-# "cannot be redeployed... currently building" — здесь это ожидаемо, не ошибка.
-redeploy_with_retry() {
-  local repo="$1"
+# Доставляет СЕГОДНЯШНИЙ код на сервис гарантированно, а не "рано или поздно
+# через вебхук форка". `railway redeploy` ЗДЕСЬ НЕ ГОДИТСЯ — он перезапускает
+# УЖЕ СОБРАННЫЙ образ, а не тянет свежий коммит; при повторном запуске этого
+# скрипта на уже существующем сервисе он молча оставлял старый код (баг,
+# из-за которого раньше приходилось руками клонировать и катить каждый
+# сервис). Вместо этого клонируем репозиторий (форк или апстрим — что реально
+# подключено) и заливаем `railway up` напрямую — источник (source connect)
+# остаётся подключён ради будущих автодеплоев по пушу, но ПЕРВАЯ доставка
+# сегодняшнего кода не ждёт вебхука. Ретраим на "currently building" — если
+# source connect только что сам запустил параллельную сборку.
+deploy_fresh_code() {
+  local repo="$1" connect_repo="$2"
+  local tmp
+  tmp=$(mktemp -d)
+  if ! ( cd "$tmp" && git clone --depth 1 "https://github.com/$connect_repo.git" . --quiet ) >>"$LOG" 2>&1; then
+    rm -rf "$tmp"
+    fail "Не смог скачать $connect_repo для деплоя $repo." "$LOG"
+  fi
+
   local attempt=0
   local max_attempts=24  # до ~4 минут ожидания
-
   while true; do
-    if railway redeploy --service "$repo" --yes --json >>"$LOG" 2>&1; then
+    if ( cd "$tmp" && railway up --service "$repo" --detach --json ) >>"$LOG" 2>&1; then
+      rm -rf "$tmp"
       return 0
     fi
     attempt=$((attempt + 1))
     if [[ $attempt -ge $max_attempts ]]; then
-      fail "Не получилось запустить сборку для $repo после $max_attempts попыток." "$LOG"
+      rm -rf "$tmp"
+      fail "Не получилось задеплоить свежий код для $repo после $max_attempts попыток." "$LOG"
     fi
     sleep 10
   done
@@ -363,8 +377,8 @@ for repo in "${REPOS[@]}"; do
   fi
   DOMAINS+=("$DOMAIN")
 
-  echo "  Запускаю сборку (может занять пару попыток, это нормально)..."
-  redeploy_with_retry "$repo"
+  echo "  Загружаю и собираю свежий код (может занять пару попыток, это нормально)..."
+  deploy_fresh_code "$repo" "$CONNECT_REPO"
 done
 
 echo ""
