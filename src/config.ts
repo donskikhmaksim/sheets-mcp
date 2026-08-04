@@ -72,6 +72,15 @@ export interface OnboardingConfig {
    * `/dashboard/<secret>`. When unset, the dashboard is disabled.
    */
   dashboardSecret?: string;
+  /**
+   * Allowlist of Google account emails (lower-cased) permitted to LINK a NEW
+   * account through onboarding (dashboard "add account" or the MCP connect
+   * flow's first-ever consent). Already-linked accounts are never affected —
+   * this only gates new additions. When unset, linking is unrestricted
+   * (fail-open, so self-hosted forks without this env var keep working as
+   * before).
+   */
+  ownerEmails?: string[];
 }
 
 export interface Config {
@@ -99,6 +108,13 @@ function loadOnboarding(): OnboardingConfig {
   const relayUrl = process.env.OAUTH_RELAY_URL?.trim().replace(/\/+$/, "") || undefined;
   const relaySecret = process.env.OAUTH_RELAY_SECRET?.trim() || undefined;
   const dashboardSecret = process.env.DASHBOARD_SECRET?.trim() || undefined;
+  const ownerEmailsRaw = process.env.OWNER_EMAILS?.trim();
+  const ownerEmails = ownerEmailsRaw
+    ? ownerEmailsRaw
+        .split(",")
+        .map((e) => e.trim().toLowerCase())
+        .filter(Boolean)
+    : undefined;
 
   const enabled = !!(
     databaseUrl &&
@@ -118,6 +134,7 @@ function loadOnboarding(): OnboardingConfig {
     relayUrl: relayUrl && relaySecret ? relayUrl : undefined,
     relaySecret: relayUrl && relaySecret ? relaySecret : undefined,
     dashboardSecret,
+    ownerEmails: ownerEmails && ownerEmails.length ? ownerEmails : undefined,
   };
 }
 
@@ -307,9 +324,14 @@ export function loadConfig(): Config {
     }
   } catch (err) {
     // With onboarding enabled, env users are optional — everyone comes from the
-    // database instead, so an absence of env credentials is fine.
+    // database instead, so an absence of env credentials is fine. But a static
+    // MCP_AUTH_TOKEN must still resolve to *someone*, or a caller presenting it
+    // gets a silent 401 (config.users would otherwise be empty). Create a
+    // placeholder holder of the token with no accounts yet; http.ts fills its
+    // accounts in from Postgres (getGoogleAccounts()) on each request.
     if (onboarding.enabled) {
-      users = [];
+      const token = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
+      users = token ? [{ name: "onboarding", token, accounts: [], defaultAccount: "" }] : [];
     } else {
       throw new Error(
         (err as Error).message +

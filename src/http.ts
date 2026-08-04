@@ -48,8 +48,26 @@ function resolveLegacyUser(req: Request, config: Config): User | null {
   return null;
 }
 
+/**
+ * Decides between the static env/legacy-token user and the live Postgres-backed
+ * onboarding user for a request authenticated by a static MCP_AUTH_TOKEN.
+ * Onboarding accounts (real, freshly-refreshable) always win over whatever the
+ * legacy user carries (which may be empty, or dead env credentials) — env is
+ * only a fallback for when nothing is linked in Postgres yet. Fails closed
+ * (null) when neither source has anything usable.
+ */
+export async function selectLegacyOrOnboardingUser(
+  legacyUser: User,
+  onboardingEnabled: boolean,
+  fetchOnboardingUser: () => Promise<User | null>,
+): Promise<User | null> {
+  if (!onboardingEnabled) return legacyUser;
+  const onboardingUser = await fetchOnboardingUser();
+  return onboardingUser ?? (legacyUser.accounts.length ? legacyUser : null);
+}
+
 /** Builds the User from ALL Google accounts linked to this instance via onboarding. */
-async function userFromGoogleAccounts(config: Config): Promise<User | null> {
+export async function userFromGoogleAccounts(config: Config): Promise<User | null> {
   const accounts = await getGoogleAccounts();
   if (!accounts.length) return null;
   const clientId = config.onboarding.googleClientId!;
@@ -98,6 +116,7 @@ export async function startHttpServer(config: Config): Promise<void> {
       baseUrl,
       relayUrl: config.onboarding.relayUrl,
       relaySecret: config.onboarding.relaySecret,
+      ownerEmails: config.onboarding.ownerEmails,
     });
 
     const issuerUrl = new URL(baseUrl);
@@ -199,7 +218,12 @@ export async function startHttpServer(config: Config): Promise<void> {
     } else if (!config.requireAuth) {
       user = config.users[0] ?? null;
     } else {
-      user = resolveLegacyUser(req, config);
+      const legacyUser = resolveLegacyUser(req, config);
+      user = legacyUser
+        ? await selectLegacyOrOnboardingUser(legacyUser, config.onboarding.enabled, () =>
+            userFromGoogleAccounts(config),
+          )
+        : null;
     }
 
     if (!user) {
