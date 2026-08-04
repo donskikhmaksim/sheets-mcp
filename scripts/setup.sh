@@ -240,6 +240,18 @@ if [[ "$LINKED" == false ]]; then
   railway init --name "$PROJECT_NAME" --json >>"$LOG" 2>&1 || fail "Не смог создать проект на Railway." "$LOG"
 fi
 
+# ID проекта нужен явно (не только через ambient `railway link` в этой
+# директории) — deploy_fresh_code ниже клонирует репозиторий в СВОЮ ВРЕМЕННУЮ
+# папку, где никакого линка нет, и передаёт -p/-e напрямую в `railway up`.
+# Резолвим заново по имени — работает и для только что переиспользованного,
+# и для только что созданного проекта.
+PROJECT_ID=$(railway list --json 2>>"$LOG" \
+  | grep -B1 "\"name\": *\"$PROJECT_NAME\"" \
+  | grep '"id"' \
+  | head -1 \
+  | sed -E 's/.*"id": *"([^"]+)".*/\1/' || true)
+[[ -n "$PROJECT_ID" ]] || fail "Не смог определить ID проекта $PROJECT_NAME." "$LOG"
+
 # Postgres: добавляем только если ещё не создан.
 HAS_POSTGRES=$(railway service list --json 2>>"$LOG" | grep -c '"name": *"Postgres"' || true)
 if [[ "$HAS_POSTGRES" -eq 0 ]]; then
@@ -260,18 +272,32 @@ fi
 # сегодняшнего кода не ждёт вебхука. Ретраим на "currently building" — если
 # source connect только что сам запустил параллельную сборку.
 deploy_fresh_code() {
-  local repo="$1" connect_repo="$2"
+  # project_id передаётся ЯВНО (-p/-e прямо в `railway up`) — команда
+  # выполняется из свежей ВРЕМЕННОЙ директории, где нет своего `railway link`,
+  # ambient-линк текущей директории скрипта на неё не распространяется
+  # (NO_LINKED_PROJECT, если этого не сделать).
+  local repo="$1" connect_repo="$2" project_id="$3"
   local tmp
   tmp=$(mktemp -d)
-  if ! ( cd "$tmp" && git clone --depth 1 "https://github.com/$connect_repo.git" . --quiet ) >>"$LOG" 2>&1; then
+  # Видимый вывод (не только в $LOG) — иначе на экране пусто по 1-3 минуты
+  # пока идёт сборка, и это выглядит как зависание, хотя всё работает.
+  # ВАЖНО: код возврата пайпа в `tee` — это код возврата САМОГО tee (почти
+  # всегда 0), не той команды слева. Без `pipefail` берём его явно через
+  # PIPESTATUS[0], иначе реальная ошибка (например, неудавшийся clone)
+  # тихо считалась бы успехом.
+  ( cd "$tmp" && git clone --depth 1 "https://github.com/$connect_repo.git" . --quiet ) 2>&1 | tee -a "$LOG"
+  if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
     rm -rf "$tmp"
     fail "Не смог скачать $connect_repo для деплоя $repo." "$LOG"
   fi
 
   local attempt=0
   local max_attempts=24  # до ~4 минут ожидания
+  local up_status
   while true; do
-    if ( cd "$tmp" && railway up --service "$repo" --detach --json ) >>"$LOG" 2>&1; then
+    ( cd "$tmp" && railway up --service "$repo" -p "$project_id" -e production --detach ) 2>&1 | tee -a "$LOG"
+    up_status=${PIPESTATUS[0]}
+    if [[ $up_status -eq 0 ]]; then
       rm -rf "$tmp"
       return 0
     fi
@@ -378,7 +404,7 @@ for repo in "${REPOS[@]}"; do
   DOMAINS+=("$DOMAIN")
 
   echo "  Загружаю и собираю свежий код (может занять пару попыток, это нормально)..."
-  deploy_fresh_code "$repo" "$CONNECT_REPO"
+  deploy_fresh_code "$repo" "$CONNECT_REPO" "$PROJECT_ID"
 done
 
 echo ""
