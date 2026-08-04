@@ -151,6 +151,14 @@ if command -v gh &>/dev/null && gh auth status &>/dev/null; then
 fi
 
 if [[ -n "$GH_USER" ]]; then
+  ok "Залогинен в GitHub как: $GH_USER"
+  if [[ "$GH_USER" == "$UPSTREAM_OWNER" ]]; then
+    echo -e "${YELLOW}⚠️  Это владелец апстрима ($UPSTREAM_OWNER).${RESET}"
+    echo "   Если ставишь ДЛЯ СЕБЯ — это нормально, продолжай."
+    echo "   Если ставишь ДЛЯ ДРУГОГО ЧЕЛОВЕКА — форк «в себя» не даст ему"
+    echo "   ни изоляции токенов, ни автообновления. Прерви (Ctrl+C) и"
+    echo "   переключи: gh auth switch --hostname github.com --user <его-логин>"
+  fi
   for repo in "${REPOS[@]}"; do
     echo "  Форкаю $UPSTREAM_OWNER/$repo → $GH_USER/$repo (идемпотентно)..."
     gh repo fork "$UPSTREAM_OWNER/$repo" --clone=false >>"$LOG" 2>&1 || true
