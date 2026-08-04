@@ -7,6 +7,14 @@
 #
 # Безопасно перезапускать: проект и уже созданные сервисы переиспользуются,
 # а не плодятся заново.
+#
+# АРХИТЕКТУРА ОБНОВЛЕНИЙ: без форков и без GitHub-приложения Railway (оно
+# требует ручной авторизации доступа к репозиторию в каждом аккаунте — на
+# практике часто ломается с ошибкой "GitHub Repo not found"). Вместо этого
+# скрипт деплоит прямо из апстрима и добавляет маленький сервис-апдейтер,
+# который сам раз в час проверяет свежий коммит и сам передеплоивает —
+# см. updater/updater.mjs. Единственный ручной шаг — создать 2 токена
+# (Railway + GitHub) один раз, дальше всё само.
 
 set -e
 
@@ -18,13 +26,17 @@ RELAY_SECRET=""
 # Google один раз навсегда. Он token-blind — токенов не видит, только пересылает
 # одноразовый код на твой сервер. Домен по умолчанию можно переопределить.
 RELAY_URL="https://relay.fix-roll.com"
+RAILWAY_UPDATER_TOKEN=""
+GITHUB_UPDATER_TOKEN=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --client-id)     CLIENT_ID="$2";     shift 2 ;;
-    --client-secret) CLIENT_SECRET="$2"; shift 2 ;;
-    --relay-secret)  RELAY_SECRET="$2";  shift 2 ;;
-    --relay-url)     RELAY_URL="$2";     shift 2 ;;
+    --client-id)       CLIENT_ID="$2";       shift 2 ;;
+    --client-secret)   CLIENT_SECRET="$2";   shift 2 ;;
+    --relay-secret)    RELAY_SECRET="$2";    shift 2 ;;
+    --relay-url)       RELAY_URL="$2";       shift 2 ;;
+    --railway-token)   RAILWAY_UPDATER_TOKEN="$2"; shift 2 ;;
+    --github-token)    GITHUB_UPDATER_TOKEN="$2";  shift 2 ;;
     *) shift ;;
   esac
 done
@@ -85,16 +97,15 @@ echo -e "${BOLD}╔════════════════════�
 echo -e "║   Google MCP — установка                 ║"
 echo -e "╚══════════════════════════════════════════╝${RESET}"
 echo ""
-echo "Скрипт форкнет 5 репозиториев на твой GitHub, задеплоит твои персональные"
-echo "серверы на Railway из этих форков (Sheets, Docs, Drive, Gmail, Calendar)"
-echo "и подключит их к Claude. Займёт ~5-7 минут."
+echo "Скрипт задеплоит твои персональные серверы на Railway (Sheets, Docs,"
+echo "Drive, Gmail, Calendar) и подключит их к Claude. Займёт ~5-7 минут."
 
 # ── Шаг 1: Railway CLI ─────────────────────────────────────────────────────
 # Нужен Railway CLI ≥ 5.17 (все команды скрипта работают одинаково на 5.17–5.24+).
 # Если railway уже установлен любой свежей версии — используем его как есть и
 # ничего не переустанавливаем (иначе npm падает с EEXIST поверх brew-бинарника).
 MIN_MAJOR=5
-step "1/5  Проверяю Railway CLI"
+step "1/4  Проверяю Railway CLI"
 
 if command -v railway &>/dev/null; then
   CURRENT_VERSION=$(railway --version 2>/dev/null | awk '{print $2}')
@@ -120,84 +131,8 @@ else
 fi
 ok "Railway CLI $(railway --version 2>&1 | head -1)"
 
-# ── Шаг 2: GitHub CLI + форки ────────────────────────────────────────────────
-# Railway должен деплоить каждый из 5 сервисов из ТВОЕГО форка, а не из
-# апстрима (donskikhmaksim/*) напрямую — иначе (а) нет механизма обновлений
-# и (б) не факт что GitHub-интеграция Railway вообще стабильно работает на
-# чужом репозитории в долгосрочной перспективе. Форкаем идемпотентно (gh repo
-# fork безопасно повторять) и включаем Actions на форке, чтобы workflow
-# синхронизации с апстримом (если он есть в репозитории) мог работать.
-step "2/5  Форкаю репозитории на твой GitHub"
-
-if ! command -v gh &>/dev/null; then
-  echo -e "${YELLOW}⚠️  GitHub CLI (gh) не найден.${RESET}"
-  echo "   Установи: brew install gh   (или https://cli.github.com)"
-  echo "   Без него не смогу форкнуть репозитории автоматически."
-fi
-
-if command -v gh &>/dev/null && ! gh auth status &>/dev/null; then
-  echo ""
-  echo "Нужен вход в GitHub (для форка репозиториев и автообновлений)."
-  if [[ -t 0 ]]; then
-    ask "Нажми Enter чтобы открыть браузер и войти в GitHub..."
-    read -r
-  fi
-  gh auth login || true
-fi
-
-GH_USER=""
-if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-  GH_USER=$(gh api user --jq .login 2>>"$LOG" || true)
-fi
-
-if [[ -n "$GH_USER" ]]; then
-  ok "Залогинен в GitHub как: $GH_USER"
-  if [[ "$GH_USER" == "$UPSTREAM_OWNER" ]]; then
-    echo -e "${YELLOW}⚠️  Это владелец апстрима ($UPSTREAM_OWNER).${RESET}"
-    echo "   Если ставишь ДЛЯ СЕБЯ — это нормально, продолжай."
-    echo "   Если ставишь ДЛЯ ДРУГОГО ЧЕЛОВЕКА — форк «в себя» не даст ему"
-    echo "   ни изоляции токенов, ни автообновления. Прерви (Ctrl+C) и"
-    echo "   переключи: gh auth switch --hostname github.com --user <его-логин>"
-  fi
-  for repo in "${REPOS[@]}"; do
-    echo "  Форкаю $UPSTREAM_OWNER/$repo → $GH_USER/$repo (идемпотентно)..."
-    gh repo fork "$UPSTREAM_OWNER/$repo" --clone=false >>"$LOG" 2>&1 || true
-    # Форк создаётся асинхронно — ждём, пока появится, прежде чем включать Actions.
-    for _ in 1 2 3 4 5 6; do
-      gh repo view "$GH_USER/$repo" &>/dev/null && break
-      sleep 5
-    done
-    if gh repo view "$GH_USER/$repo" &>/dev/null; then
-      gh api -X PUT "repos/$GH_USER/$repo/actions/permissions" \
-        -F enabled=true -f allowed_actions=all >>"$LOG" 2>&1 || true
-    else
-      echo -e "${YELLOW}    Форк $repo не появился вовремя — если ниже упадёт подключение${RESET}"
-      echo -e "${YELLOW}    источника, зайди на github.com и форкни его вручную.${RESET}"
-    fi
-  done
-  ok "Форки готовы под аккаунтом $GH_USER"
-else
-  echo ""
-  echo -e "${YELLOW}Не удалось форкнуть автоматически (нужен GitHub CLI 'gh', авторизованный).${RESET}"
-  echo "Форкни репозитории вручную в браузере:"
-  echo ""
-  for repo in "${REPOS[@]}"; do
-    echo -e "  ${CYAN}https://github.com/$UPSTREAM_OWNER/$repo/fork${RESET}"
-  done
-  echo ""
-  echo "На каждом форке: вкладка Actions → «I understand the risks, enable»."
-  echo ""
-  if [[ -t 0 ]]; then
-    ask "Введи свой GitHub-логин (владельца форков, или Enter — подключить апстрим напрямую, без обновлений):"
-    read -r GH_USER
-  fi
-  if [[ -z "$GH_USER" ]]; then
-    fail "Без форка Railway не сможет автообновляться, а подключение напрямую к $UPSTREAM_OWNER/<repo> может вообще не сработать (Railway требует доступ владельца репозитория). Прерываю — форкни репозитории (см. ссылки выше) и запусти скрипт снова, указав логин." ""
-  fi
-fi
-
-# ── Шаг 3: Логин в Railway ─────────────────────────────────────────────────
-step "3/5  Войди в Railway"
+# ── Шаг 2: Логин в Railway ─────────────────────────────────────────────────
+step "2/4  Войди в Railway"
 if railway whoami &>/dev/null; then
   ok "Уже авторизован в Railway ($(railway whoami 2>/dev/null | tail -1))"
 else
@@ -214,8 +149,8 @@ else
   ok "Авторизован в Railway"
 fi
 
-# ── Шаг 4: Деплой ───────────────────────────────────────────────────────────
-step "4/5  Деплою серверы (это самая долгая часть, ~3-5 минут)"
+# ── Шаг 3: Деплой ───────────────────────────────────────────────────────────
+step "3/4  Деплою серверы (это самая долгая часть, ~3-5 минут)"
 
 WORK_DIR=$(mktemp -d)
 cd "$WORK_DIR"
@@ -269,22 +204,24 @@ else
   echo "База данных уже есть, пропускаю."
 fi
 
-# Доставляет СЕГОДНЯШНИЙ код на сервис гарантированно, а не "рано или поздно
-# через вебхук форка". `railway redeploy` ЗДЕСЬ НЕ ГОДИТСЯ — он перезапускает
-# УЖЕ СОБРАННЫЙ образ, а не тянет свежий коммит; при повторном запуске этого
-# скрипта на уже существующем сервисе он молча оставлял старый код (баг,
-# из-за которого раньше приходилось руками клонировать и катить каждый
-# сервис). Вместо этого клонируем репозиторий (форк или апстрим — что реально
-# подключено) и заливаем `railway up` напрямую — источник (source connect)
-# остаётся подключён ради будущих автодеплоев по пушу, но ПЕРВАЯ доставка
-# сегодняшнего кода не ждёт вебхука. Ретраим на "currently building" — если
-# source connect только что сам запустил параллельную сборку.
+# Доставляет СЕГОДНЯШНИЙ код на сервис гарантированно. `railway redeploy`
+# ЗДЕСЬ НЕ ГОДИТСЯ — он перезапускает УЖЕ СОБРАННЫЙ образ, а не тянет свежий
+# коммит; при повторном запуске этого скрипта на уже существующем сервисе он
+# молча оставлял старый код (баг, из-за которого раньше приходилось руками
+# клонировать и катить каждый сервис). Вместо этого клонируем репозиторий
+# напрямую из апстрима (форки больше не используются — см. апдейтер ниже) и
+# заливаем `railway up` напрямую. Ретраим на "currently building" — если
+# что-то другое сейчас параллельно собирается.
+#
+# subdir (необязательный 4-й аргумент) — деплоить не корень репо, а
+# поддиректорию (нужно для сервиса-апдейтера, который живёт в updater/
+# внутри этого же репозитория).
 deploy_fresh_code() {
   # project_id передаётся ЯВНО (-p/-e прямо в `railway up`) — команда
   # выполняется из свежей ВРЕМЕННОЙ директории, где нет своего `railway link`,
   # ambient-линк текущей директории скрипта на неё не распространяется
   # (NO_LINKED_PROJECT, если этого не сделать).
-  local repo="$1" connect_repo="$2" project_id="$3"
+  local repo="$1" connect_repo="$2" project_id="$3" subdir="${4:-}"
   local tmp
   tmp=$(mktemp -d)
   # Видимый вывод (не только в $LOG) — иначе на экране пусто по 1-3 минуты
@@ -299,11 +236,14 @@ deploy_fresh_code() {
     fail "Не смог скачать $connect_repo для деплоя $repo." "$LOG"
   fi
 
+  local deploy_dir="$tmp"
+  [[ -n "$subdir" ]] && deploy_dir="$tmp/$subdir"
+
   local attempt=0
   local max_attempts=24  # до ~4 минут ожидания
   local up_status
   while true; do
-    ( cd "$tmp" && railway up --service "$repo" -p "$project_id" -e production --detach ) 2>&1 | tee -a "$LOG"
+    ( cd "$deploy_dir" && railway up --service "$repo" -p "$project_id" -e production --detach ) 2>&1 | tee -a "$LOG"
     up_status=${PIPESTATUS[0]}
     if [[ $up_status -eq 0 ]]; then
       rm -rf "$tmp"
@@ -363,28 +303,7 @@ for repo in "${REPOS[@]}"; do
     echo "  Сервис уже существует, обновляю переменные и передеплою."
   fi
 
-  # Источник — ТВОЙ форк (если удалось его завести в шаге 2/5), а не апстрим
-  # напрямую: иначе у тебя нет механизма обновлений и Railway сидит на
-  # репозитории, которым ты не владеешь. Фолбэк на апстрим — только если
-  # форк недоступен (gh не залогинен и логин не ввели).
   CONNECT_REPO="$UPSTREAM_OWNER/$repo"
-  [[ -n "$GH_USER" ]] && CONNECT_REPO="$GH_USER/$repo"
-
-  # Подключаем источник ВСЕГДА, даже если сервис уже был — прошлая неудачная
-  # попытка могла создать пустой сервис и упасть до этого шага (например,
-  # из-за несовместимой версии Railway CLI). Без источника `redeploy` вечно
-  # будет отвечать "No deployment found for service", сколько ни повторяй.
-  echo "  Подключаю код ($CONNECT_REPO)..."
-  STEP_OUT=$(mktemp)
-  if ! railway service source connect --repo "$CONNECT_REPO" --branch main --service "$repo" --json >"$STEP_OUT" 2>&1; then
-    if grep -qi "already" "$STEP_OUT"; then
-      echo "  (источник уже был подключён раньше — это нормально)"
-    else
-      cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
-      fail "Не смог подключить GitHub-репозиторий $CONNECT_REPO для $repo." "$LOG"
-    fi
-  fi
-  cat "$STEP_OUT" >> "$LOG"; rm -f "$STEP_OUT"
 
   echo "  Задаю переменные..."
   railway variable set "DATABASE_URL=\${{Postgres.DATABASE_URL}}" --service "$repo" --skip-deploys --json >>"$LOG" 2>&1 \
@@ -432,14 +351,93 @@ for repo in "${REPOS[@]}"; do
   i=$((i + 1))
 done
 
+ok "Все 5 серверов запущены"
+
+# ── Шаг 4: Апдейтер (автообновления без форков и без GitHub App) ────────────
+step "4/4  Настраиваю автообновление"
+
+echo ""
+echo "Чтобы код обновлялся сам (без повторного запуска этой команды), нужен"
+echo "маленький фоновый сервис. Ему нужны 2 токена — единственный ручной шаг,"
+echo "который нельзя автоматизировать (ни Railway, ни GitHub не дают создать"
+echo "токен программно, только руками, один раз, навсегда)."
+echo ""
+
+# Переиспользуем уже заданные токены при повторном запуске — не спрашиваем дважды.
+EXISTING_RAILWAY_TOKEN=$(railway variable list --service updater --kv 2>>"$LOG" | grep '^RAILWAY_TOKEN=' | head -1 | cut -d= -f2- || true)
+EXISTING_GITHUB_TOKEN=$(railway variable list --service updater --kv 2>>"$LOG" | grep '^GITHUB_TOKEN=' | head -1 | cut -d= -f2- || true)
+[[ -z "$RAILWAY_UPDATER_TOKEN" && -n "$EXISTING_RAILWAY_TOKEN" ]] && RAILWAY_UPDATER_TOKEN="$EXISTING_RAILWAY_TOKEN"
+[[ -z "$GITHUB_UPDATER_TOKEN" && -n "$EXISTING_GITHUB_TOKEN" ]] && GITHUB_UPDATER_TOKEN="$EXISTING_GITHUB_TOKEN"
+
+if [[ -n "$EXISTING_RAILWAY_TOKEN" && -n "$EXISTING_GITHUB_TOKEN" ]]; then
+  ok "Токены апдейтера уже заданы — переиспользую."
+fi
+
+if [[ -z "$RAILWAY_UPDATER_TOKEN" ]]; then
+  echo ""
+  echo -e "1. Открой ${CYAN}https://railway.com/account/tokens${RESET}"
+  echo "   Впиши любое Name, выбери свой Workspace → Create → скопируй значение."
+  echo ""
+  if [[ -t 0 ]]; then
+    ask "Вставь Railway-токен:"
+    read -r -s RAILWAY_UPDATER_TOKEN
+    echo ""
+  fi
+fi
+
+if [[ -z "$GITHUB_UPDATER_TOKEN" ]]; then
+  echo ""
+  echo -e "2. Открой ${CYAN}https://github.com/settings/tokens/new${RESET}"
+  echo "   Note — любой, галочки scope НЕ отмечай — Generate token → скопируй."
+  echo ""
+  if [[ -t 0 ]]; then
+    ask "Вставь GitHub-токен:"
+    read -r -s GITHUB_UPDATER_TOKEN
+    echo ""
+  fi
+fi
+
+if [[ -z "$RAILWAY_UPDATER_TOKEN" || -z "$GITHUB_UPDATER_TOKEN" ]]; then
+  echo -e "${YELLOW}⚠️  Токены не заданы — автообновление НЕ настроено.${RESET}"
+  echo "   Серверы работают, но код придётся обновлять, перезапуская эту команду."
+  echo "   Чтобы включить позже: запусти команду ещё раз с --railway-token и --github-token,"
+  echo "   или добавь их вручную в Variables сервиса updater в Railway."
+else
+  ALREADY_EXISTS=$(railway service list --json 2>>"$LOG" | grep -c '"name": *"updater"' || true)
+  if [[ "$ALREADY_EXISTS" -eq 0 ]]; then
+    echo "Создаю сервис updater..."
+    railway add --service updater --json >>"$LOG" 2>&1 || fail "Не смог создать сервис updater." "$LOG"
+  fi
+
+  # SERVICES — репо каждого из 5 сервисов, апдейтер сверяет их все раз в час.
+  SERVICES_JSON="["
+  first=true
+  for repo in "${REPOS[@]}"; do
+    [[ "$first" == true ]] && first=false || SERVICES_JSON+=","
+    SERVICES_JSON+="{\"service\":\"$repo\",\"repo\":\"$UPSTREAM_OWNER/$repo\"}"
+  done
+  SERVICES_JSON+="]"
+
+  echo "Задаю переменные апдейтера..."
+  railway variable set "RAILWAY_TOKEN=$RAILWAY_UPDATER_TOKEN" --service updater --skip-deploys --json >>"$LOG" 2>&1 \
+    || fail "Не смог задать RAILWAY_TOKEN для updater." "$LOG"
+  railway variable set "GITHUB_TOKEN=$GITHUB_UPDATER_TOKEN" --service updater --skip-deploys --json >>"$LOG" 2>&1 \
+    || fail "Не смог задать GITHUB_TOKEN для updater." "$LOG"
+  railway variable set "PROJECT_ID=$PROJECT_ID" --service updater --skip-deploys --json >>"$LOG" 2>&1 \
+    || fail "Не смог задать PROJECT_ID для updater." "$LOG"
+  railway variable set "SERVICES=$SERVICES_JSON" --service updater --skip-deploys --json >>"$LOG" 2>&1 \
+    || fail "Не смог задать SERVICES для updater." "$LOG"
+
+  echo "Деплою апдейтер (updater/ из sheets-mcp)..."
+  deploy_fresh_code "updater" "$UPSTREAM_OWNER/sheets-mcp" "$PROJECT_ID" "updater"
+
+  ok "Апдейтер настроен — раз в час сам проверяет и обновляет все 5 сервисов."
+fi
+
 cd /
 rm -rf "$WORK_DIR"
 
-ok "Все 5 серверов запущены"
-
 # ── Готово ──────────────────────────────────────────────────────────────────
-step "5/5  Готово"
-
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════╗"
 echo -e "║   ✅  Всё готово!                        ║"
@@ -474,10 +472,4 @@ echo "  Там можно подключить несколько своих Goo
 echo "  (например personal / work) и выбрать основной. В Claude переключайся"
 echo "  между ними параметром account. Токены хранятся только на твоём сервере."
 echo ""
-if [[ -n "$GH_USER" ]]; then
-  echo -e "${YELLOW}Форки:${RESET} Railway задеплоен из твоих форков (github.com/$GH_USER/<repo>)."
-  echo "Если в репозитории есть workflow автосинка с апстримом — обновления"
-  echo "прилетят сами; иначе подтягивай их вручную (Sync fork на GitHub)."
-  echo ""
-fi
 echo -e "${BOLD}Проверка:${RESET} напиши Claude «Покажи мои файлы на Google Диске»"

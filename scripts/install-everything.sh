@@ -17,6 +17,10 @@ RELAY_URL="https://relay.fix-roll.com"
 TICKTICK_CLIENT_ID=""
 TICKTICK_CLIENT_SECRET=""
 TIMEZONE=""   # пусто = каждый вложенный скрипт сам определит по этому компьютеру
+# Токены апдейтера — один и тот же человек, один Railway-аккаунт и один
+# GitHub-аккаунт на оба проекта, поэтому пробрасываем в обе части одинаково.
+RAILWAY_UPDATER_TOKEN=""
+GITHUB_UPDATER_TOKEN=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,6 +31,8 @@ while [[ $# -gt 0 ]]; do
     --ticktick-client-id)    TICKTICK_CLIENT_ID="$2";    shift 2 ;;
     --ticktick-client-secret) TICKTICK_CLIENT_SECRET="$2"; shift 2 ;;
     --timezone)              TIMEZONE="$2";               shift 2 ;;
+    --railway-token)         RAILWAY_UPDATER_TOKEN="$2"; shift 2 ;;
+    --github-token)          GITHUB_UPDATER_TOKEN="$2";  shift 2 ;;
     *) shift ;;
   esac
 done
@@ -50,6 +56,9 @@ echo "потом TickTick. Суммарно ~10-12 минут."
 
 TZ_ARGS=()
 [[ -n "$TIMEZONE" ]] && TZ_ARGS=(--timezone "$TIMEZONE")
+TOKEN_ARGS=()
+[[ -n "$RAILWAY_UPDATER_TOKEN" ]] && TOKEN_ARGS+=(--railway-token "$RAILWAY_UPDATER_TOKEN")
+[[ -n "$GITHUB_UPDATER_TOKEN" ]]  && TOKEN_ARGS+=(--github-token "$GITHUB_UPDATER_TOKEN")
 
 echo ""
 echo -e "${CYAN}▶ Часть 1/2 — Google (Sheets/Docs/Drive/Gmail/Calendar)${RESET}"
@@ -57,14 +66,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/donskikhmaksim/sheets-mcp/ma
   --client-id "$GOOGLE_CLIENT_ID" \
   --client-secret "$GOOGLE_CLIENT_SECRET" \
   --relay-secret "$RELAY_SECRET" \
-  --relay-url "$RELAY_URL"
+  --relay-url "$RELAY_URL" \
+  "${TOKEN_ARGS[@]}"
 
 echo ""
 echo -e "${CYAN}▶ Часть 2/2 — TickTick${RESET}"
 bash <(curl -fsSL https://raw.githubusercontent.com/donskikhmaksim/ticktick-mcp/main/scripts/setup.sh) \
   --client-id "$TICKTICK_CLIENT_ID" \
   --client-secret "$TICKTICK_CLIENT_SECRET" \
-  "${TZ_ARGS[@]}"
+  "${TZ_ARGS[@]}" \
+  "${TOKEN_ARGS[@]}"
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════╗"

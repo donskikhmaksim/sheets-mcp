@@ -1,0 +1,13 @@
+{
+  "name": "mcp-updater",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Polls GitHub for new commits and redeploys watched Railway services via railway up. No GitHub App, no webhook, no fork.",
+  "scripts": {
+    "start": "node updater.mjs"
+  },
+  "dependencies": {
+    "@railway/cli": "^5.24.0"
+  }
+}
