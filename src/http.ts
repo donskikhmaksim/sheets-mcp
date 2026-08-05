@@ -15,7 +15,7 @@ import {
   listApprovedUnexecuted,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
-import { buildUserClients } from "./accounts.js";
+import { buildUserClients, setAutoExecuteClients } from "./accounts.js";
 import { tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig } from "./server.js";
 import { handleWebhook, registerWebhook, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
 import { tryAutoExecute } from "./consent.js";
@@ -124,6 +124,11 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
     return;
   }
   const clients = buildUserClients(user);
+  // Published so gated tools' registered `rehash` (module scope, no
+  // request-scoped `clients` closure available) can resolve a live
+  // GoogleClients for the manifest's own account — see accounts.ts's
+  // setAutoExecuteClients/getAutoExecuteClients doc-comment.
+  setAutoExecuteClients(clients);
 
   for (const c of candidates) {
     const executor = getAutoExecutor(c.tool);

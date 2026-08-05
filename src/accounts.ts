@@ -17,6 +17,48 @@ export interface UserClients {
   baseGmailQuery(name?: string): string;
 }
 
+/**
+ * Module-level cache of the most recently resolved `UserClients`, set by
+ * http.ts's `runAutoExecutePoller` right before it drives Telegram-button
+ * auto-execute for a poll tick (Максим, 2026-08-05 — see consent.ts's
+ * `tryAutoExecute` doc-comment).
+ *
+ * WHY THIS EXISTS: gated tools' `rehash` callbacks close over a per-request
+ * `GoogleClients` (resolved from the MCP call's own `account` argument via
+ * `clients.resolve(account)`), because they normally only ever run inside
+ * `registerSheetsTools`/`registerTriageTools`'s request-scoped closure. The
+ * auto-execute registry (`autoExecute.ts`) is different: `registerAutoExecutor`
+ * calls happen ONCE at module import time, and `tryAutoExecute()` (consent.ts)
+ * invokes the registered `rehash` with ONLY `row.payload` — no request, no
+ * `clients`, by design (`RehashFn`'s signature is fixed and portable across
+ * all 5 Google MCP servers, see autoExecute.ts's own doc-comment — it must
+ * not gain a second parameter just for this).
+ *
+ * This getter/setter pair is the narrow bridge: `runAutoExecutePoller` is the
+ * ONE place outside a real MCP request that legitimately needs a live
+ * `UserClients` (it already resolves one, the exact same way a real request
+ * would via `userFromGoogleAccounts(config) ?? config.users[0]`), so it
+ * publishes it here right before driving the loop. Every gated tool's
+ * registered `rehash` in tools/sheets.ts / tools/triage.ts reads it back to
+ * resolve the account named in the manifest's own payload — the SAME
+ * computation the tool's own request-scoped `rehash` performs, just sourcing
+ * `g` from here instead of a request closure. Never read on the normal MCP
+ * request path (that path always has a real `clients` in closure already).
+ */
+let lastAutoExecuteClients: UserClients | null = null;
+
+export function setAutoExecuteClients(c: UserClients): void {
+  lastAutoExecuteClients = c;
+}
+
+/** Non-null exactly while a poll tick that found candidates is running (set
+ * by runAutoExecutePoller before its loop) — see doc-comment above. A gated
+ * tool's registered `rehash` calling this outside that window would be a
+ * wiring bug (auto-execute's rehash should only ever run from the poller). */
+export function getAutoExecuteClients(): UserClients | null {
+  return lastAutoExecuteClients;
+}
+
 export function buildUserClients(user: User): UserClients {
   const map = new Map<string, GoogleClients>();
   const queries = new Map<string, string>();

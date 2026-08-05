@@ -3,9 +3,10 @@
  */
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { sheets_v4 } from "googleapis";
 import { ok, fail, guard, safeText, mapWithLimit } from "../util.js";
-import { accountField, type UserClients } from "../accounts.js";
+import { accountField, getAutoExecuteClients, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import {
   requireConsent,
@@ -17,6 +18,7 @@ import {
   type ConsentPlan,
   type TgApprovalGate,
 } from "../consent.js";
+import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 
 /** One row of the shared consent_audit log, as read by `sheets_consent_audit`.
  * Mirrors store.ts's `ConsentAuditRow` structurally — same "don't import
@@ -541,6 +543,689 @@ async function dryFindMatches(
   return found;
 }
 
+// ── Payload shapes stored in consent_manifests for the gated tools below ────
+// These are exactly what `decision.payload` carries back in the confirmed
+// branch — the source of truth for the mutation, never the caller's arguments
+// on the execute call (plan §A3 blocker requirement). Module-level (not
+// nested inside `registerSheetsTools`, unlike the request-scoped code that
+// builds them) so both the tool handler AND the module-level auto-executors
+// registered further down (Максим, 2026-08-05 — Telegram-button auto-execute,
+// see autoExecute.ts) can reference the same type.
+interface WriteRangeItem {
+  spreadsheetId: string;
+  range: string;
+  values: unknown[][];
+  valueInputOption?: "USER_ENTERED" | "RAW";
+}
+interface WriteRangePayload {
+  account: string;
+  items: WriteRangeItem[];
+}
+interface AppendRowsItem {
+  spreadsheetId: string;
+  range: string;
+  values: unknown[][];
+  valueInputOption?: "USER_ENTERED" | "RAW";
+}
+interface AppendRowsPayload {
+  account: string;
+  items: AppendRowsItem[];
+}
+interface ClearRangeItem {
+  spreadsheetId: string;
+  range: string;
+}
+interface ClearRangePayload {
+  account: string;
+  items: ClearRangeItem[];
+}
+interface CreateItem {
+  title: string;
+  sheetTitles?: string[];
+}
+interface CreatePayload {
+  account: string;
+  spreadsheets: CreateItem[];
+}
+interface AddTabItem {
+  spreadsheetId: string;
+  title: string;
+}
+interface AddTabPayload {
+  account: string;
+  items: AddTabItem[];
+}
+interface FindReplacePayload {
+  account: string;
+  spreadsheetId: string;
+  find: string;
+  replace: string;
+  matchCase: boolean;
+  sheetId?: number;
+}
+type FormatItem = {
+  spreadsheetId: string;
+  range: string;
+  bold?: boolean;
+  italic?: boolean;
+  fontSize?: number;
+  textColor?: string;
+  backgroundColor?: string;
+  horizontalAlignment?: "LEFT" | "CENTER" | "RIGHT";
+  verticalAlignment?: "TOP" | "MIDDLE" | "BOTTOM";
+  wrapStrategy?: "OVERFLOW_CELL" | "CLIP" | "WRAP";
+  numberFormatType?: "NUMBER" | "CURRENCY" | "PERCENT" | "DATE" | "TIME" | "DATE_TIME" | "TEXT" | "SCIENTIFIC";
+  numberFormatPattern?: string;
+};
+interface FormatRangePayload {
+  account: string;
+  items: FormatItem[];
+}
+interface RawBatchPayload {
+  account: string;
+  spreadsheetId: string;
+  requests: object[];
+}
+
+// ── Binding-snapshot helpers, hoisted to module level ────────────────────────
+// Originally declared inside `registerSheetsTools` (request-scoped); moved
+// here UNCHANGED (they only ever took `g`/items as explicit parameters, no
+// closure over `clients`/`ctx`/`server`) so the module-level `rehash` callbacks
+// registered via `registerAutoExecutor` below can call them too — the auto-
+// execute registry is populated once at import time, outside any request.
+async function writeRangeBindingSnapshot(g: GoogleClients, items: WriteRangeItem[]) {
+  return mapWithLimit(items, async (it) => ({
+    spreadsheetId: it.spreadsheetId,
+    range: it.range,
+    preValues: (await liveRangeValues(g, it.spreadsheetId, it.range)) ?? [],
+  }));
+}
+async function appendBindingSnapshot(g: GoogleClients, items: AppendRowsItem[]) {
+  return mapWithLimit(items, async (it) => ({
+    spreadsheetId: it.spreadsheetId,
+    title: await liveSpreadsheetTitle(g, it.spreadsheetId),
+  }));
+}
+async function clearBindingSnapshot(g: GoogleClients, items: ClearRangeItem[]) {
+  return mapWithLimit(items, async (it) => ({
+    spreadsheetId: it.spreadsheetId,
+    range: it.range,
+    preValues: (await liveRangeValues(g, it.spreadsheetId, it.range)) ?? [],
+  }));
+}
+async function addTabBindingSnapshot(g: GoogleClients, items: AddTabItem[]) {
+  return mapWithLimit(items, async (it) => ({
+    spreadsheetId: it.spreadsheetId,
+    title: it.title,
+    liveTitle: await liveSpreadsheetTitle(g, it.spreadsheetId),
+    liveTabs: (await liveTabTitles(g, it.spreadsheetId)) ?? [],
+  }));
+}
+async function formatBindingSnapshot(g: GoogleClients, items: FormatItem[]) {
+  return mapWithLimit(items, async (it) => {
+    try {
+      const res = await g.sheets.spreadsheets.get({
+        spreadsheetId: it.spreadsheetId,
+        ranges: [it.range],
+        includeGridData: true,
+        fields: "sheets(data(rowData(values(userEnteredFormat))))",
+      });
+      const cell = res.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values?.[0];
+      return { spreadsheetId: it.spreadsheetId, range: it.range, currentFormat: summariseFormat(cell?.userEnteredFormat) };
+    } catch {
+      return { spreadsheetId: it.spreadsheetId, range: it.range, currentFormat: null };
+    }
+  });
+}
+
+/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
+ * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn).
+ * Ported from gmail-mcp's tools/gmail.ts. */
+function extractText(result: CallToolResult): string {
+  const first = result.content?.[0];
+  return first && first.type === "text" ? first.text : JSON.stringify(result);
+}
+
+// ── Auto-execute cores (Максим, 2026-08-05) ──────────────────────────────────
+// Ядро исполнения каждого гейтованного тула — вынесено из тела тула (после
+// `decision.kind === "confirmed"`), чтобы БЫТЬ ВЫЗЫВАЕМЫМ И ИЗ обычного MCP
+// tool-хендлера (модель вызвала execute второй раз), И ИЗ фонового
+// авто-поллера (кнопка в Telegram сама триггерит это через autoExecute.ts,
+// без участия модели вообще — см. consent.ts's `tryAutoExecute` doc-comment).
+// Логика мутации НЕ изменена ни на строчку — только извлечена в функцию.
+// Регистрация автоисполнителей — на уровне МОДУЛЯ (autoExecute.ts's
+// doc-comment: `registerSheetsTools` вызывается заново на каждый запрос).
+
+async function executeWriteRangeCore(
+  g: GoogleClients,
+  payload: WriteRangePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const preSnapshot = await writeRangeBindingSnapshot(g, payload.items);
+
+  // Group by spreadsheetId (same batching strategy as before the gate).
+  const byId = new Map<string, WriteRangeItem[]>();
+  for (const item of payload.items) {
+    const list = byId.get(item.spreadsheetId) ?? [];
+    list.push(item);
+    byId.set(item.spreadsheetId, list);
+  }
+  const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; updatedCells?: number | null; error?: string }> = [];
+  for (const [spreadsheetId, group] of byId) {
+    if (group.length === 1) {
+      const { range, values, valueInputOption } = group[0];
+      try {
+        const res = await g.sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range,
+          valueInputOption: valueInputOption ?? "USER_ENTERED",
+          requestBody: { values },
+        });
+        results.push({ spreadsheetId, range, updatedRange: res.data.updatedRange ?? range, updatedCells: res.data.updatedCells });
+      } catch (e: unknown) {
+        results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+      }
+    } else {
+      const vio = group[0].valueInputOption ?? "USER_ENTERED";
+      try {
+        const res = await g.sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId,
+          requestBody: { valueInputOption: vio, data: group.map(({ range, values }) => ({ range, values })) },
+        });
+        for (const [i, resp] of (res.data.responses ?? []).entries()) {
+          results.push({ spreadsheetId, range: group[i]?.range, updatedRange: resp.updatedRange ?? undefined, updatedCells: resp.updatedCells });
+        }
+      } catch (e: unknown) {
+        for (const it of group) results.push({ spreadsheetId, range: it.range, error: String(e instanceof Error ? e.message : e) });
+      }
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Written",
+    summaryIcon: "✏️",
+    verify: (r) => postVerifyRangeWritten(g, r.spreadsheetId, r.range!, payload.items.find((it) => it.spreadsheetId === r.spreadsheetId && it.range === r.range)?.values ?? []),
+    reportTitle: "Независимая проверка записи",
+    reportSubtitle: "запрошено ⇄ живое содержимое Google Sheets",
+    consentStore,
+    auditId,
+    preSnapshot,
+  });
+}
+
+registerAutoExecutor("sheets_write_range", {
+  rehash: async (addressing) => {
+    const a = addressing as WriteRangePayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve(a.account);
+    const snapshot = await writeRangeBindingSnapshot(g, a.items);
+    return sha256({
+      account: a.account,
+      items: snapshot.map((s) => ({ spreadsheetId: s.spreadsheetId, range: s.range, preValues: s.preValues })),
+    });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as WriteRangePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeWriteRangeCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeAppendRowsCore(
+  g: GoogleClients,
+  payload: AppendRowsPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; error?: string }> = [];
+  for (const { spreadsheetId, range, values, valueInputOption } of payload.items) {
+    try {
+      const res = await g.sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range,
+        valueInputOption: valueInputOption ?? "USER_ENTERED",
+        insertDataOption: "INSERT_ROWS",
+        requestBody: { values },
+      });
+      results.push({ spreadsheetId, range, updatedRange: res.data.updates?.updatedRange ?? range });
+    } catch (e: unknown) {
+      results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Appended",
+    summaryIcon: "➕",
+    verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, null, r.updatedRange ?? r.spreadsheetId),
+    reportTitle: "Независимая проверка добавления строк",
+    reportSubtitle: "запрошено ⇄ живое состояние Google Sheets",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("sheets_append_rows", {
+  rehash: async (addressing) => {
+    const a = addressing as AppendRowsPayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve(a.account);
+    const snapshot = await appendBindingSnapshot(g, a.items);
+    return sha256({ account: a.account, items: snapshot });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as AppendRowsPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeAppendRowsCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeClearRangeCore(
+  g: GoogleClients,
+  payload: ClearRangePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const preSnapshot = await clearBindingSnapshot(g, payload.items);
+  const results: Array<{ spreadsheetId: string; range?: string; clearedRange?: string; clearedRowCount?: number; error?: string }> = [];
+  for (const { spreadsheetId, range } of payload.items) {
+    try {
+      const before = preSnapshot.find((s) => s.spreadsheetId === spreadsheetId && s.range === range)?.preValues ?? [];
+      const res = await g.sheets.spreadsheets.values.clear({ spreadsheetId, range });
+      results.push({ spreadsheetId, range, clearedRange: res.data.clearedRange ?? range, clearedRowCount: before.length });
+    } catch (e: unknown) {
+      results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Cleared",
+    summaryIcon: "🧹",
+    verify: (r) => postVerifyRangeCleared(g, r.spreadsheetId, r.range!),
+    reportTitle: "Независимая проверка очистки",
+    reportSubtitle: "запрошено ⇄ живое содержимое Google Sheets",
+    consentStore,
+    auditId,
+    preSnapshot,
+  });
+}
+
+registerAutoExecutor("sheets_clear_range", {
+  rehash: async (addressing) => {
+    const a = addressing as ClearRangePayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve(a.account);
+    const snapshot = await clearBindingSnapshot(g, a.items);
+    return sha256({ account: a.account, items: snapshot });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ClearRangePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeClearRangeCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeCreateCore(
+  g: GoogleClients,
+  payload: CreatePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results = await Promise.all(
+    payload.spreadsheets.map(async ({ title, sheetTitles }) => {
+      try {
+        const res = await g.sheets.spreadsheets.create({
+          requestBody: {
+            properties: { title },
+            sheets: sheetTitles?.length ? sheetTitles.map((t) => ({ properties: { title: t } })) : undefined,
+          },
+          fields: "spreadsheetId,spreadsheetUrl,properties.title",
+        });
+        return { spreadsheetId: res.data.spreadsheetId ?? "", title: res.data.properties?.title ?? title, spreadsheetUrl: res.data.spreadsheetUrl };
+      } catch (e: unknown) {
+        return { spreadsheetId: "", title, error: String(e instanceof Error ? e.message : e) };
+      }
+    }),
+  );
+
+  return buildMutationResult({
+    results,
+    total: payload.spreadsheets.length,
+    verb: "Created",
+    summaryIcon: "📄",
+    verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, r.title, r.title),
+    reportTitle: "Независимая проверка создания",
+    reportSubtitle: "запрошено ⇄ живое состояние Google Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("sheets_create", {
+  rehash: (addressing) => sha256(addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as CreatePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeCreateCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeAddTabCore(
+  g: GoogleClients,
+  payload: AddTabPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const results: Array<{ spreadsheetId: string; sheetId?: number; title?: string; error?: string }> = [];
+  for (const { spreadsheetId, title } of payload.items) {
+    try {
+      const res = await g.sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: { requests: [{ addSheet: { properties: { title } } }] },
+      });
+      const props = res.data.replies?.[0]?.addSheet?.properties;
+      results.push({ spreadsheetId, sheetId: props?.sheetId ?? undefined, title: props?.title ?? title });
+    } catch (e: unknown) {
+      results.push({ spreadsheetId, title, error: String(e instanceof Error ? e.message : e) });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Added",
+    summaryIcon: "📑",
+    verify: (r) => postVerifyTabExists(g, r.spreadsheetId, r.title!),
+    reportTitle: "Независимая проверка добавления вкладки",
+    reportSubtitle: "запрошено ⇄ живой список вкладок",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("sheets_add_tab", {
+  rehash: async (addressing) => {
+    const a = addressing as AddTabPayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve(a.account);
+    const snapshot = await addTabBindingSnapshot(g, a.items);
+    return sha256({ account: a.account, items: snapshot.map(({ spreadsheetId, title, liveTitle, liveTabs }) => ({ spreadsheetId, title, liveTitle, liveTabs })) });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as AddTabPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeAddTabCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeFindReplaceCore(
+  g: GoogleClients,
+  payload: FindReplacePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const preMatches = await dryFindMatches(g, {
+    spreadsheetId: payload.spreadsheetId,
+    find: payload.find,
+    matchCase: payload.matchCase,
+    sheetId: payload.sheetId,
+  });
+  let fr: sheets_v4.Schema$FindReplaceResponse = {};
+  let execError: string | undefined;
+  try {
+    const res = await g.sheets.spreadsheets.batchUpdate({
+      spreadsheetId: payload.spreadsheetId,
+      requestBody: {
+        requests: [
+          {
+            findReplace: {
+              find: payload.find,
+              replacement: payload.replace,
+              matchCase: payload.matchCase,
+              allSheets: payload.sheetId === undefined ? true : undefined,
+              sheetId: payload.sheetId,
+            },
+          },
+        ],
+      },
+    });
+    fr = res.data.replies?.[0]?.findReplace ?? {};
+  } catch (e: unknown) {
+    execError = String(e instanceof Error ? e.message : e);
+  }
+
+  // Post-verify: re-read each previously-matched cell and confirm it no
+  // longer holds the old value (or, if find===replace, that it's unchanged).
+  const pv = await mapWithLimit(preMatches, async (m): Promise<VerifyLine> => {
+    const cellRange = `${m.sheet ? `'${m.sheet}'!` : ""}${m.cell}`;
+    const live = await liveRangeValues(g, payload.spreadsheetId, cellRange);
+    const liveVal = live?.[0]?.[0] != null ? String(live[0][0]) : "";
+    const expected = payload.matchCase
+      ? m.value.split(payload.find).join(payload.replace)
+      : m.value.replace(new RegExp(payload.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"), payload.replace);
+    if (live === null) return { outcome: "warn", line: `- ⚠️ **${safeText(m.cell)}** — не удалось перепроверить` };
+    if (payload.find === payload.replace) return { outcome: "ok", line: `- ✅ **${safeText(m.cell)}** — без изменений (find===replace)` };
+    if (liveVal === expected) return { outcome: "ok", line: `- ✅ **${safeText(m.cell)}** — «${safeText(liveVal, 60)}»` };
+    return { outcome: "mismatch", line: `- ❌ **${safeText(m.cell)}** — живое «${safeText(liveVal, 60)}», ожидалось «${safeText(expected, 60)}»` };
+  });
+  const worst = worstOutcome(pv);
+  const icon = execError ? "❌" : worst === "mismatch" ? "❌" : worst === "warn" ? "⚠️" : "🔁";
+  const summary = execError
+    ? `❌ Find&replace failed: ${execError}`
+    : `${icon} Replaced "${payload.find}" -> "${payload.replace}" — ${fr.occurrencesChanged ?? preMatches.length} occurrence(s)${payload.sheetId !== undefined ? ` (sheet ${payload.sheetId})` : " (all sheets)"}`;
+  if (consentStore && auditId) {
+    await consentStore
+      .updateConsentAuditOutcome(auditId, {
+        outcome: execError ? "failed" : "confirmed",
+        postVerify: summary + (pv.length ? ` · post-verify: ${pv.map((p) => p.line).join("; ")}` : ""),
+        error: execError ?? null,
+        preSnapshot: preMatches,
+      })
+      .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
+  }
+  return ok({
+    summary,
+    findReplace: fr,
+    ...(pv.length ? { verification: renderVerifyReport("Независимая проверка замены", "запрошено ⇄ живое содержимое затронутых ячеек", pv) } : {}),
+  });
+}
+
+registerAutoExecutor("sheets_find_replace", {
+  rehash: async (addressing) => {
+    const a = addressing as FindReplacePayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve(a.account);
+    const matches = await dryFindMatches(g, { spreadsheetId: a.spreadsheetId, find: a.find, matchCase: a.matchCase, sheetId: a.sheetId });
+    return sha256({
+      spreadsheetId: a.spreadsheetId,
+      find: a.find,
+      replace: a.replace,
+      matchCase: a.matchCase,
+      sheetId: a.sheetId ?? null,
+      matches: matches.map((m) => ({ sheet: m.sheet, cell: m.cell, value: m.value })),
+    });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as FindReplacePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeFindReplaceCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeFormatRangeCore(
+  g: GoogleClients,
+  payload: FormatRangePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const approvedItems = payload.items;
+  const results: Array<{ spreadsheetId: string; range: string; applied?: number; error?: string }> = [];
+
+  for (const item of approvedItems) {
+    const {
+      spreadsheetId, range, bold, italic, fontSize, textColor,
+      backgroundColor, horizontalAlignment, verticalAlignment, wrapStrategy,
+      numberFormatType, numberFormatPattern,
+    } = item;
+    try {
+      const fmt: sheets_v4.Schema$CellFormat = {};
+      const fields: string[] = [];
+      const textFormat: sheets_v4.Schema$TextFormat = {};
+      if (bold !== undefined) { textFormat.bold = bold; fields.push("userEnteredFormat.textFormat.bold"); }
+      if (italic !== undefined) { textFormat.italic = italic; fields.push("userEnteredFormat.textFormat.italic"); }
+      if (fontSize !== undefined) { textFormat.fontSize = fontSize; fields.push("userEnteredFormat.textFormat.fontSize"); }
+      if (textColor) { textFormat.foregroundColor = hexToColor(textColor); fields.push("userEnteredFormat.textFormat.foregroundColor"); }
+      if (Object.keys(textFormat).length) fmt.textFormat = textFormat;
+      if (backgroundColor) { fmt.backgroundColor = hexToColor(backgroundColor); fields.push("userEnteredFormat.backgroundColor"); }
+      if (horizontalAlignment) { fmt.horizontalAlignment = horizontalAlignment; fields.push("userEnteredFormat.horizontalAlignment"); }
+      if (verticalAlignment) { fmt.verticalAlignment = verticalAlignment; fields.push("userEnteredFormat.verticalAlignment"); }
+      if (wrapStrategy) { fmt.wrapStrategy = wrapStrategy; fields.push("userEnteredFormat.wrapStrategy"); }
+      if (numberFormatPattern || numberFormatType) {
+        fmt.numberFormat = { type: numberFormatType ?? "NUMBER", pattern: numberFormatPattern };
+        fields.push("userEnteredFormat.numberFormat");
+      }
+      if (!fields.length) {
+        results.push({ spreadsheetId, range, error: "No formatting options specified." });
+        continue;
+      }
+
+      const meta = await g.sheets.spreadsheets.get({
+        spreadsheetId,
+        fields: "sheets.properties(sheetId,title)",
+      });
+      const titleToId = new Map<string, number>();
+      for (const s of meta.data.sheets ?? []) {
+        if (s.properties?.title && typeof s.properties.sheetId === "number") {
+          titleToId.set(s.properties.title, s.properties.sheetId);
+        }
+      }
+      const firstSheetId = meta.data.sheets?.[0]?.properties?.sheetId ?? 0;
+      const gridRange = a1ToGridRange(range, titleToId, firstSheetId);
+
+      await g.sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [
+            { repeatCell: { range: gridRange, cell: { userEnteredFormat: fmt }, fields: fields.join(",") } },
+          ],
+        },
+      });
+      results.push({ spreadsheetId, range, applied: fields.length });
+    } catch (e: unknown) {
+      results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
+    }
+  }
+
+  return buildMutationResult({
+    results,
+    total: approvedItems.length,
+    verb: "Formatted",
+    summaryIcon: "🎨",
+    verify: (r) => {
+      const it = approvedItems.find((x) => x.spreadsheetId === r.spreadsheetId && x.range === r.range)!;
+      return postVerifyFormatApplied(g, r.spreadsheetId, r.range, {
+        bold: it.bold,
+        italic: it.italic,
+        fontSize: it.fontSize,
+      });
+    },
+    reportTitle: "Независимая проверка форматирования",
+    reportSubtitle: "запрошено ⇄ живое форматирование Google Sheets",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("sheets_format_range", {
+  rehash: async (addressing) => {
+    const a = addressing as FormatRangePayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve(a.account);
+    const snapshot = await formatBindingSnapshot(g, a.items);
+    return sha256({ account: a.account, items: snapshot });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as FormatRangePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeFormatRangeCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeRawBatchCore(
+  g: GoogleClients,
+  payload: RawBatchPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  let replies: sheets_v4.Schema$Response[] | undefined;
+  let execError: string | undefined;
+  try {
+    const res = await g.sheets.spreadsheets.batchUpdate({
+      spreadsheetId: payload.spreadsheetId,
+      requestBody: { requests: payload.requests },
+    });
+    replies = res.data.replies ?? undefined;
+  } catch (e: unknown) {
+    execError = String(e instanceof Error ? e.message : e);
+  }
+  const verify = await postVerifyRawBatchApplied(g, payload.spreadsheetId);
+  const icon = execError ? "❌" : "⚠️"; // always ⚠️ on success — honest limit, see postVerifyRawBatchApplied
+  const summary = execError
+    ? `❌ Raw batchUpdate failed: ${execError}`
+    : `${icon} Applied ${payload.requests.length} raw request(s) to spreadsheet`;
+  if (consentStore && auditId) {
+    await consentStore
+      .updateConsentAuditOutcome(auditId, {
+        outcome: execError ? "failed" : "confirmed",
+        postVerify: `${summary} · ${verify.line}`,
+        error: execError ?? null,
+      })
+      .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
+  }
+  return ok({
+    summary,
+    spreadsheetId: payload.spreadsheetId,
+    replies,
+    verification: renderVerifyReport("Независимая проверка raw batchUpdate", "запрошено ⇄ доступность таблицы (содержимое не проверяется — честный предел)", [verify]),
+  });
+}
+
+registerAutoExecutor("sheets_raw_batch_update", {
+  rehash: async (addressing) => {
+    const a = addressing as RawBatchPayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve(a.account);
+    const title = await liveSpreadsheetTitle(g, a.spreadsheetId);
+    return sha256({ spreadsheetId: a.spreadsheetId, title, requests: a.requests });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as RawBatchPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeRawBatchCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
 export function registerSheetsTools(server: McpServer, clients: UserClients, ctx: SheetsConsentContext = DEFAULT_CONSENT_CTX) {
   const account = accountField(clients);
 
@@ -678,30 +1363,11 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
   // to write several ranges. Items targeting the same spreadsheet are written
   // via batchUpdate in one call; different spreadsheets are written sequentially
   // (to avoid conflicts within a spreadsheet while allowing parallelism across them).
-  interface WriteRangeItem {
-    spreadsheetId: string;
-    range: string;
-    values: unknown[][];
-    valueInputOption?: "USER_ENTERED" | "RAW";
-  }
-  interface WriteRangePayload {
-    account: string;
-    items: WriteRangeItem[];
-  }
-
-  /** Binding surface: for EACH item, re-reads the range's CURRENT (pre-write)
-   * content live and returns {spreadsheetId, range, preValues}. Called
-   * identically at plan time (to seed objectHash + the pre-snapshot) and at
-   * execute time via `rehash` (to detect drift) — a concurrent edit to the
-   * range between plan and execute changes `preValues` and trips the binding
-   * mismatch (gate.md §3.3(2)); this is a REAL check, not `sha256(payload)`. */
-  async function writeRangeBindingSnapshot(g: GoogleClients, items: WriteRangeItem[]) {
-    return mapWithLimit(items, async (it) => ({
-      spreadsheetId: it.spreadsheetId,
-      range: it.range,
-      preValues: (await liveRangeValues(g, it.spreadsheetId, it.range)) ?? [],
-    }));
-  }
+  // `WriteRangeItem`/`WriteRangePayload`/`writeRangeBindingSnapshot` now live at
+  // module level (see the "Payload shapes" / "Binding-snapshot helpers"
+  // sections above `registerSheetsTools`) — the module-level auto-executor
+  // registered further down needs them too, and a function-local declaration
+  // wouldn't be visible there.
 
   server.registerTool(
     "sheets_write_range",
@@ -799,58 +1465,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const preSnapshot = await writeRangeBindingSnapshot(g, payload.items);
-
-      // Group by spreadsheetId (same batching strategy as before the gate).
-      const byId = new Map<string, WriteRangeItem[]>();
-      for (const item of payload.items) {
-        const list = byId.get(item.spreadsheetId) ?? [];
-        list.push(item);
-        byId.set(item.spreadsheetId, list);
-      }
-      const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; updatedCells?: number | null; error?: string }> = [];
-      for (const [spreadsheetId, group] of byId) {
-        if (group.length === 1) {
-          const { range, values, valueInputOption } = group[0];
-          try {
-            const res = await g.sheets.spreadsheets.values.update({
-              spreadsheetId,
-              range,
-              valueInputOption: valueInputOption ?? "USER_ENTERED",
-              requestBody: { values },
-            });
-            results.push({ spreadsheetId, range, updatedRange: res.data.updatedRange ?? range, updatedCells: res.data.updatedCells });
-          } catch (e: unknown) {
-            results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
-          }
-        } else {
-          const vio = group[0].valueInputOption ?? "USER_ENTERED";
-          try {
-            const res = await g.sheets.spreadsheets.values.batchUpdate({
-              spreadsheetId,
-              requestBody: { valueInputOption: vio, data: group.map(({ range, values }) => ({ range, values })) },
-            });
-            for (const [i, resp] of (res.data.responses ?? []).entries()) {
-              results.push({ spreadsheetId, range: group[i]?.range, updatedRange: resp.updatedRange ?? undefined, updatedCells: resp.updatedCells });
-            }
-          } catch (e: unknown) {
-            for (const it of group) results.push({ spreadsheetId, range: it.range, error: String(e instanceof Error ? e.message : e) });
-          }
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Written",
-        summaryIcon: "✏️",
-        verify: (r) => postVerifyRangeWritten(g, r.spreadsheetId, r.range!, payload.items.find((it) => it.spreadsheetId === r.spreadsheetId && it.range === r.range)?.values ?? []),
-        reportTitle: "Независимая проверка записи",
-        reportSubtitle: "запрошено ⇄ живое содержимое Google Sheets",
-        consentStore,
-        auditId,
-        preSnapshot,
-      });
+      return executeWriteRangeCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -863,22 +1478,9 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
   // the spreadsheet's live title, catching rename/delete between plan and
   // execute) rather than content-based, since "the end of the data" isn't a
   // stable thing to bind against.
-  interface AppendRowsItem {
-    spreadsheetId: string;
-    range: string;
-    values: unknown[][];
-    valueInputOption?: "USER_ENTERED" | "RAW";
-  }
-  interface AppendRowsPayload {
-    account: string;
-    items: AppendRowsItem[];
-  }
-  async function appendBindingSnapshot(g: GoogleClients, items: AppendRowsItem[]) {
-    return mapWithLimit(items, async (it) => ({
-      spreadsheetId: it.spreadsheetId,
-      title: await liveSpreadsheetTitle(g, it.spreadsheetId),
-    }));
-  }
+  // `AppendRowsItem`/`AppendRowsPayload`/`appendBindingSnapshot` now live at
+  // module level (see above `registerSheetsTools`) — needed by the
+  // module-level auto-executor registered further down.
 
   server.registerTool(
     "sheets_append_rows",
@@ -961,52 +1563,13 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; error?: string }> = [];
-      for (const { spreadsheetId, range, values, valueInputOption } of payload.items) {
-        try {
-          const res = await g.sheets.spreadsheets.values.append({
-            spreadsheetId,
-            range,
-            valueInputOption: valueInputOption ?? "USER_ENTERED",
-            insertDataOption: "INSERT_ROWS",
-            requestBody: { values },
-          });
-          results.push({ spreadsheetId, range, updatedRange: res.data.updates?.updatedRange ?? range });
-        } catch (e: unknown) {
-          results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Appended",
-        summaryIcon: "➕",
-        verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, null, r.updatedRange ?? r.spreadsheetId),
-        reportTitle: "Независимая проверка добавления строк",
-        reportSubtitle: "запрошено ⇄ живое состояние Google Sheets",
-        consentStore,
-        auditId,
-      });
+      return executeAppendRowsCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── sheets_clear_range ─────────────────────────────────────────────────────
-  interface ClearRangeItem {
-    spreadsheetId: string;
-    range: string;
-  }
-  interface ClearRangePayload {
-    account: string;
-    items: ClearRangeItem[];
-  }
-  async function clearBindingSnapshot(g: GoogleClients, items: ClearRangeItem[]) {
-    return mapWithLimit(items, async (it) => ({
-      spreadsheetId: it.spreadsheetId,
-      range: it.range,
-      preValues: (await liveRangeValues(g, it.spreadsheetId, it.range)) ?? [],
-    }));
-  }
+  // `ClearRangeItem`/`ClearRangePayload`/`clearBindingSnapshot` now live at
+  // module level (see above `registerSheetsTools`).
 
   server.registerTool(
     "sheets_clear_range",
@@ -1089,42 +1652,13 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const preSnapshot = await clearBindingSnapshot(g, payload.items);
-      const results: Array<{ spreadsheetId: string; range?: string; clearedRange?: string; clearedRowCount?: number; error?: string }> = [];
-      for (const { spreadsheetId, range } of payload.items) {
-        try {
-          const before = preSnapshot.find((s) => s.spreadsheetId === spreadsheetId && s.range === range)?.preValues ?? [];
-          const res = await g.sheets.spreadsheets.values.clear({ spreadsheetId, range });
-          results.push({ spreadsheetId, range, clearedRange: res.data.clearedRange ?? range, clearedRowCount: before.length });
-        } catch (e: unknown) {
-          results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Cleared",
-        summaryIcon: "🧹",
-        verify: (r) => postVerifyRangeCleared(g, r.spreadsheetId, r.range!),
-        reportTitle: "Независимая проверка очистки",
-        reportSubtitle: "запрошено ⇄ живое содержимое Google Sheets",
-        consentStore,
-        auditId,
-        preSnapshot,
-      });
+      return executeClearRangeCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── sheets_create ──────────────────────────────────────────────────────────
-  interface CreateItem {
-    title: string;
-    sheetTitles?: string[];
-  }
-  interface CreatePayload {
-    account: string;
-    spreadsheets: CreateItem[];
-  }
+  // `CreateItem`/`CreatePayload` now live at module level (see above
+  // `registerSheetsTools`).
 
   server.registerTool(
     "sheets_create",
@@ -1203,54 +1737,13 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results = await Promise.all(
-        payload.spreadsheets.map(async ({ title, sheetTitles }) => {
-          try {
-            const res = await g.sheets.spreadsheets.create({
-              requestBody: {
-                properties: { title },
-                sheets: sheetTitles?.length ? sheetTitles.map((t) => ({ properties: { title: t } })) : undefined,
-              },
-              fields: "spreadsheetId,spreadsheetUrl,properties.title",
-            });
-            return { spreadsheetId: res.data.spreadsheetId ?? "", title: res.data.properties?.title ?? title, spreadsheetUrl: res.data.spreadsheetUrl };
-          } catch (e: unknown) {
-            return { spreadsheetId: "", title, error: String(e instanceof Error ? e.message : e) };
-          }
-        }),
-      );
-
-      return buildMutationResult({
-        results,
-        total: payload.spreadsheets.length,
-        verb: "Created",
-        summaryIcon: "📄",
-        verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, r.title, r.title),
-        reportTitle: "Независимая проверка создания",
-        reportSubtitle: "запрошено ⇄ живое состояние Google Drive",
-        consentStore,
-        auditId,
-      });
+      return executeCreateCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── sheets_add_tab ─────────────────────────────────────────────────────────
-  interface AddTabItem {
-    spreadsheetId: string;
-    title: string;
-  }
-  interface AddTabPayload {
-    account: string;
-    items: AddTabItem[];
-  }
-  async function addTabBindingSnapshot(g: GoogleClients, items: AddTabItem[]) {
-    return mapWithLimit(items, async (it) => ({
-      spreadsheetId: it.spreadsheetId,
-      title: it.title,
-      liveTitle: await liveSpreadsheetTitle(g, it.spreadsheetId),
-      liveTabs: (await liveTabTitles(g, it.spreadsheetId)) ?? [],
-    }));
-  }
+  // `AddTabItem`/`AddTabPayload`/`addTabBindingSnapshot` now live at module
+  // level (see above `registerSheetsTools`).
 
   server.registerTool(
     "sheets_add_tab",
@@ -1329,43 +1822,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const results: Array<{ spreadsheetId: string; sheetId?: number; title?: string; error?: string }> = [];
-      for (const { spreadsheetId, title } of payload.items) {
-        try {
-          const res = await g.sheets.spreadsheets.batchUpdate({
-            spreadsheetId,
-            requestBody: { requests: [{ addSheet: { properties: { title } } }] },
-          });
-          const props = res.data.replies?.[0]?.addSheet?.properties;
-          results.push({ spreadsheetId, sheetId: props?.sheetId ?? undefined, title: props?.title ?? title });
-        } catch (e: unknown) {
-          results.push({ spreadsheetId, title, error: String(e instanceof Error ? e.message : e) });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Added",
-        summaryIcon: "📑",
-        verify: (r) => postVerifyTabExists(g, r.spreadsheetId, r.title!),
-        reportTitle: "Независимая проверка добавления вкладки",
-        reportSubtitle: "запрошено ⇄ живой список вкладок",
-        consentStore,
-        auditId,
-      });
+      return executeAddTabCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── sheets_find_replace ────────────────────────────────────────────────────
-  interface FindReplacePayload {
-    account: string;
-    spreadsheetId: string;
-    find: string;
-    replace: string;
-    matchCase: boolean;
-    sheetId?: number;
-  }
+  // `FindReplacePayload` now lives at module level (see above `registerSheetsTools`).
 
   server.registerTool(
     "sheets_find_replace",
@@ -1457,108 +1919,13 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const preMatches = await dryFindMatches(g, {
-        spreadsheetId: payload.spreadsheetId,
-        find: payload.find,
-        matchCase: payload.matchCase,
-        sheetId: payload.sheetId,
-      });
-      let fr: sheets_v4.Schema$FindReplaceResponse = {};
-      let execError: string | undefined;
-      try {
-        const res = await g.sheets.spreadsheets.batchUpdate({
-          spreadsheetId: payload.spreadsheetId,
-          requestBody: {
-            requests: [
-              {
-                findReplace: {
-                  find: payload.find,
-                  replacement: payload.replace,
-                  matchCase: payload.matchCase,
-                  allSheets: payload.sheetId === undefined ? true : undefined,
-                  sheetId: payload.sheetId,
-                },
-              },
-            ],
-          },
-        });
-        fr = res.data.replies?.[0]?.findReplace ?? {};
-      } catch (e: unknown) {
-        execError = String(e instanceof Error ? e.message : e);
-      }
-
-      // Post-verify: re-read each previously-matched cell and confirm it no
-      // longer holds the old value (or, if find===replace, that it's unchanged).
-      const pv = await mapWithLimit(preMatches, async (m): Promise<VerifyLine> => {
-        const cellRange = `${m.sheet ? `'${m.sheet}'!` : ""}${m.cell}`;
-        const live = await liveRangeValues(g, payload.spreadsheetId, cellRange);
-        const liveVal = live?.[0]?.[0] != null ? String(live[0][0]) : "";
-        const expected = payload.matchCase
-          ? m.value.split(payload.find).join(payload.replace)
-          : m.value.replace(new RegExp(payload.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"), payload.replace);
-        if (live === null) return { outcome: "warn", line: `- ⚠️ **${safeText(m.cell)}** — не удалось перепроверить` };
-        if (payload.find === payload.replace) return { outcome: "ok", line: `- ✅ **${safeText(m.cell)}** — без изменений (find===replace)` };
-        if (liveVal === expected) return { outcome: "ok", line: `- ✅ **${safeText(m.cell)}** — «${safeText(liveVal, 60)}»` };
-        return { outcome: "mismatch", line: `- ❌ **${safeText(m.cell)}** — живое «${safeText(liveVal, 60)}», ожидалось «${safeText(expected, 60)}»` };
-      });
-      const worst = worstOutcome(pv);
-      const icon = execError ? "❌" : worst === "mismatch" ? "❌" : worst === "warn" ? "⚠️" : "🔁";
-      const summary = execError
-        ? `❌ Find&replace failed: ${execError}`
-        : `${icon} Replaced "${payload.find}" -> "${payload.replace}" — ${fr.occurrencesChanged ?? preMatches.length} occurrence(s)${payload.sheetId !== undefined ? ` (sheet ${payload.sheetId})` : " (all sheets)"}`;
-      if (consentStore && auditId) {
-        await consentStore
-          .updateConsentAuditOutcome(auditId, {
-            outcome: execError ? "failed" : "confirmed",
-            postVerify: summary + (pv.length ? ` · post-verify: ${pv.map((p) => p.line).join("; ")}` : ""),
-            error: execError ?? null,
-            preSnapshot: preMatches,
-          })
-          .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
-      }
-      return ok({
-        summary,
-        findReplace: fr,
-        ...(pv.length ? { verification: renderVerifyReport("Независимая проверка замены", "запрошено ⇄ живое содержимое затронутых ячеек", pv) } : {}),
-      });
+      return executeFindReplaceCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── sheets_format_range ────────────────────────────────────────────────────
-  type FormatItem = {
-    spreadsheetId: string;
-    range: string;
-    bold?: boolean;
-    italic?: boolean;
-    fontSize?: number;
-    textColor?: string;
-    backgroundColor?: string;
-    horizontalAlignment?: "LEFT" | "CENTER" | "RIGHT";
-    verticalAlignment?: "TOP" | "MIDDLE" | "BOTTOM";
-    wrapStrategy?: "OVERFLOW_CELL" | "CLIP" | "WRAP";
-    numberFormatType?: "NUMBER" | "CURRENCY" | "PERCENT" | "DATE" | "TIME" | "DATE_TIME" | "TEXT" | "SCIENTIFIC";
-    numberFormatPattern?: string;
-  };
-  interface FormatRangePayload {
-    account: string;
-    items: FormatItem[];
-  }
-  async function formatBindingSnapshot(g: GoogleClients, items: FormatItem[]) {
-    return mapWithLimit(items, async (it) => {
-      try {
-        const res = await g.sheets.spreadsheets.get({
-          spreadsheetId: it.spreadsheetId,
-          ranges: [it.range],
-          includeGridData: true,
-          fields: "sheets(data(rowData(values(userEnteredFormat))))",
-        });
-        const cell = res.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values?.[0];
-        return { spreadsheetId: it.spreadsheetId, range: it.range, currentFormat: summariseFormat(cell?.userEnteredFormat) };
-      } catch {
-        return { spreadsheetId: it.spreadsheetId, range: it.range, currentFormat: null };
-      }
-    });
-  }
+  // `FormatItem`/`FormatRangePayload`/`formatBindingSnapshot` now live at
+  // module level (see above `registerSheetsTools`).
 
   server.registerTool(
     "sheets_format_range",
@@ -1665,82 +2032,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const approvedItems = payload.items;
-      const results: Array<{ spreadsheetId: string; range: string; applied?: number; error?: string }> = [];
-
-      for (const item of approvedItems) {
-        const {
-          spreadsheetId, range, bold, italic, fontSize, textColor,
-          backgroundColor, horizontalAlignment, verticalAlignment, wrapStrategy,
-          numberFormatType, numberFormatPattern,
-        } = item;
-        try {
-          const fmt: sheets_v4.Schema$CellFormat = {};
-          const fields: string[] = [];
-          const textFormat: sheets_v4.Schema$TextFormat = {};
-          if (bold !== undefined) { textFormat.bold = bold; fields.push("userEnteredFormat.textFormat.bold"); }
-          if (italic !== undefined) { textFormat.italic = italic; fields.push("userEnteredFormat.textFormat.italic"); }
-          if (fontSize !== undefined) { textFormat.fontSize = fontSize; fields.push("userEnteredFormat.textFormat.fontSize"); }
-          if (textColor) { textFormat.foregroundColor = hexToColor(textColor); fields.push("userEnteredFormat.textFormat.foregroundColor"); }
-          if (Object.keys(textFormat).length) fmt.textFormat = textFormat;
-          if (backgroundColor) { fmt.backgroundColor = hexToColor(backgroundColor); fields.push("userEnteredFormat.backgroundColor"); }
-          if (horizontalAlignment) { fmt.horizontalAlignment = horizontalAlignment; fields.push("userEnteredFormat.horizontalAlignment"); }
-          if (verticalAlignment) { fmt.verticalAlignment = verticalAlignment; fields.push("userEnteredFormat.verticalAlignment"); }
-          if (wrapStrategy) { fmt.wrapStrategy = wrapStrategy; fields.push("userEnteredFormat.wrapStrategy"); }
-          if (numberFormatPattern || numberFormatType) {
-            fmt.numberFormat = { type: numberFormatType ?? "NUMBER", pattern: numberFormatPattern };
-            fields.push("userEnteredFormat.numberFormat");
-          }
-          if (!fields.length) {
-            results.push({ spreadsheetId, range, error: "No formatting options specified." });
-            continue;
-          }
-
-          const meta = await g.sheets.spreadsheets.get({
-            spreadsheetId,
-            fields: "sheets.properties(sheetId,title)",
-          });
-          const titleToId = new Map<string, number>();
-          for (const s of meta.data.sheets ?? []) {
-            if (s.properties?.title && typeof s.properties.sheetId === "number") {
-              titleToId.set(s.properties.title, s.properties.sheetId);
-            }
-          }
-          const firstSheetId = meta.data.sheets?.[0]?.properties?.sheetId ?? 0;
-          const gridRange = a1ToGridRange(range, titleToId, firstSheetId);
-
-          await g.sheets.spreadsheets.batchUpdate({
-            spreadsheetId,
-            requestBody: {
-              requests: [
-                { repeatCell: { range: gridRange, cell: { userEnteredFormat: fmt }, fields: fields.join(",") } },
-              ],
-            },
-          });
-          results.push({ spreadsheetId, range, applied: fields.length });
-        } catch (e: unknown) {
-          results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
-        }
-      }
-
-      return buildMutationResult({
-        results,
-        total: approvedItems.length,
-        verb: "Formatted",
-        summaryIcon: "🎨",
-        verify: (r) => {
-          const it = approvedItems.find((x) => x.spreadsheetId === r.spreadsheetId && x.range === r.range)!;
-          return postVerifyFormatApplied(g, r.spreadsheetId, r.range, {
-            bold: it.bold,
-            italic: it.italic,
-            fontSize: it.fontSize,
-          });
-        },
-        reportTitle: "Независимая проверка форматирования",
-        reportSubtitle: "запрошено ⇄ живое форматирование Google Sheets",
-        consentStore,
-        auditId,
-      });
+      return executeFormatRangeCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -1758,11 +2050,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
   // Post-verify is honestly ALWAYS ⚠️ (STANDARD §15.1 Q20: an operation where
   // generic post-verify is technically impossible must be named up front) —
   // see postVerifyRawBatchApplied above and GUIDE.md.
-  interface RawBatchPayload {
-    account: string;
-    spreadsheetId: string;
-    requests: object[];
-  }
+  // `RawBatchPayload` now lives at module level (see above `registerSheetsTools`).
 
   server.registerTool(
     "sheets_raw_batch_update",
@@ -1838,37 +2126,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      let replies: sheets_v4.Schema$Response[] | undefined;
-      let execError: string | undefined;
-      try {
-        const res = await g.sheets.spreadsheets.batchUpdate({
-          spreadsheetId: payload.spreadsheetId,
-          requestBody: { requests: payload.requests },
-        });
-        replies = res.data.replies ?? undefined;
-      } catch (e: unknown) {
-        execError = String(e instanceof Error ? e.message : e);
-      }
-      const verify = await postVerifyRawBatchApplied(g, payload.spreadsheetId);
-      const icon = execError ? "❌" : "⚠️"; // always ⚠️ on success — honest limit, see postVerifyRawBatchApplied
-      const summary = execError
-        ? `❌ Raw batchUpdate failed: ${execError}`
-        : `${icon} Applied ${payload.requests.length} raw request(s) to spreadsheet`;
-      if (consentStore && auditId) {
-        await consentStore
-          .updateConsentAuditOutcome(auditId, {
-            outcome: execError ? "failed" : "confirmed",
-            postVerify: `${summary} · ${verify.line}`,
-            error: execError ?? null,
-          })
-          .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
-      }
-      return ok({
-        summary,
-        spreadsheetId: payload.spreadsheetId,
-        replies,
-        verification: renderVerifyReport("Независимая проверка raw batchUpdate", "запрошено ⇄ доступность таблицы (содержимое не проверяется — честный предел)", [verify]),
-      });
+      return executeRawBatchCore(g, payload, auditId, consentStore);
     }),
   );
 
