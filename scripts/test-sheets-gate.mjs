@@ -33,7 +33,14 @@ function makeSheetWorld() {
   const ranges = new Map([["S1", new Map([["Sheet1!A1", [["old"]]]])]]);
   const titles = new Map([["S1", "My Sheet"]]);
   const tabs = new Map([["S1", ["Sheet1"]]]);
-  return { ranges, titles, tabs };
+  // Counts calls to spreadsheets.get that asked ONLY for properties.title —
+  // i.e. liveSpreadsheetTitle / cachedSpreadsheetTitle, not the tab-list or
+  // format-snapshot variants that pass a different `fields` value. Used to
+  // assert the per-request title cache actually avoids refetching for a
+  // batch that shares one spreadsheetId (mcp-development-standard human-
+  // readable-output fix: "получить title одним вызовом и закэшировать").
+  const titleOnlyGetCalls = { count: 0 };
+  return { ranges, titles, tabs, titleOnlyGetCalls };
 }
 
 function buildClients(world) {
@@ -48,6 +55,7 @@ function buildClients(world) {
             if (fields?.includes("sheets.properties.title")) {
               return { data: { sheets: (world.tabs.get(spreadsheetId) ?? []).map((t) => ({ properties: { title: t } })) } };
             }
+            if (fields === "properties.title") world.titleOnlyGetCalls.count++;
             return { data: { properties: { title: world.titles.get(spreadsheetId) ?? null } } };
           },
           batchUpdate: async () => ({ data: { replies: [{ addSheet: { properties: { sheetId: 1, title: "New tab" } } }] } }),
@@ -64,6 +72,19 @@ function buildClients(world) {
               m.set(range, []);
               world.ranges.set(spreadsheetId, m);
               return { data: { clearedRange: range } };
+            },
+            // sheets_write_range batches >1 item targeting the SAME
+            // spreadsheetId into one values.batchUpdate call (see
+            // src/tools/sheets.ts's byId grouping) — needed for the [1b]
+            // title-cache test below, which writes 2 ranges on one sheet.
+            batchUpdate: async ({ spreadsheetId, requestBody }) => {
+              const m = world.ranges.get(spreadsheetId) ?? new Map();
+              const responses = (requestBody.data ?? []).map(({ range, values }) => {
+                m.set(range, values);
+                return { updatedRange: range, updatedCells: values.flat().length };
+              });
+              world.ranges.set(spreadsheetId, m);
+              return { data: { responses } };
             },
           },
         },
@@ -142,6 +163,34 @@ console.log("\n[1] sheets_write_range: full plan→confirm round trip, mutation 
   check("execute succeeds — summary shows 1/1, no error", execBody.includes('"summary": "✏️ Written 1/1"'), execBody.slice(0, 60));
   check("world IS mutated", world.ranges.get("S1").get("Sheet1!A1")[0][0] === "new value");
   check("post-verify report attached with ✅", execBody.includes("Независимая проверка записи") && execBody.includes("✅"));
+  check("human-readable output: result item carries the spreadsheet's title, not just its raw id", execBody.includes('"spreadsheetTitle": "My Sheet"'), execBody.slice(0, 400));
+}
+
+// ── [1b] title cache: a batch sharing one spreadsheetId fetches the title once, not per item ─
+console.log("\n[1b] sheets_write_range: 2 items, same spreadsheetId → title fetched at most once (per-request cache)");
+{
+  const world = makeSheetWorld();
+  const { cli } = await harness(world);
+  const planResp = await cli.callTool({
+    name: "sheets_write_range",
+    arguments: {
+      items: [
+        { spreadsheetId: "S1", range: "Sheet1!A1", values: [["a"]] },
+        { spreadsheetId: "S1", range: "Sheet1!B1", values: [["b"]] },
+      ],
+    },
+  });
+  const manifestId = extractManifestId(text(planResp));
+  const beforeExecuteCalls = world.titleOnlyGetCalls.count;
+  const execResp = await cli.callTool({ name: "sheets_write_range", arguments: { manifest_id: manifestId, user_reply: "да" } });
+  const execBody = text(execResp);
+  check("execute succeeds — summary shows 2/2", execBody.includes('"summary": "✏️ Written 2/2"'), execBody.slice(0, 60));
+  check(
+    "title fetched exactly once during execute for 2 items sharing one spreadsheetId (not 0, not 2)",
+    world.titleOnlyGetCalls.count - beforeExecuteCalls === 1,
+    `titleOnlyGetCalls went from ${beforeExecuteCalls} to ${world.titleOnlyGetCalls.count}`,
+  );
+  check("both result items carry the same cached spreadsheetTitle", (execBody.match(/"spreadsheetTitle": "My Sheet"/g) ?? []).length === 2, execBody.slice(0, 600));
 }
 
 // ── [2] binding drift: someone edits the range between plan and execute ─────

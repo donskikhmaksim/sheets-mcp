@@ -72,8 +72,12 @@ export async function mapWithLimit<T, R>(
   return results;
 }
 
-/** Retry on 429/rate-limit/5xx with exponential backoff (1s, 2s, 4s). */
-async function withRetry<R>(fn: () => Promise<R>, attempts = 3): Promise<R> {
+/** Retry on 429/rate-limit/5xx with exponential backoff (1s, 2s, 4s). Exported
+ * so individual mutating API calls in sequential for-loops (sheets_write_range,
+ * sheets_append_rows, sheets_clear_range, sheets_add_tab, sheets_format_range,
+ * sheets_find_replace, sheets_raw_batch_update) can wrap just the one call that
+ * hits the network, without changing the loops' sequential structure. */
+export async function withRetry<R>(fn: () => Promise<R>, attempts = 3): Promise<R> {
   let lastErr: unknown;
   for (let a = 0; a < attempts; a++) {
     try {
