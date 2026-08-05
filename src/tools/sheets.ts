@@ -4,8 +4,90 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { sheets_v4 } from "googleapis";
-import { ok, fail, guard } from "../util.js";
+import { ok, fail, guard, safeText, mapWithLimit } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
+import type { GoogleClients } from "../google.js";
+import {
+  requireConsent,
+  sha256,
+  formatLaTime,
+  USER_REPLY_DOC,
+  type ConsentStore,
+  type ConsentConfig,
+  type ConsentPlan,
+} from "../consent.js";
+
+/** One row of the shared consent_audit log, as read by `sheets_consent_audit`.
+ * Mirrors store.ts's `ConsentAuditRow` structurally — same "don't import
+ * store.ts directly, context provides adapters" convention as elsewhere;
+ * `server.ts` wires the real implementation in. */
+interface ConsentAuditRow {
+  id: string;
+  ts: number;
+  tool: string;
+  accountLabel: string;
+  manifestId?: string | null;
+  objectHash?: string | null;
+  userReply: string;
+  outcome: string;
+  refusalReason?: string | null;
+  actor: string;
+  postVerifyResult: string | null;
+  error: string | null;
+  preSnapshot: unknown;
+}
+
+interface ConsentAuditFilters {
+  server: string;
+  since?: number;
+  until?: number;
+  accountLabel?: string;
+  tool?: string;
+  outcome?: string;
+}
+
+/** Read-only access to the consent-gate audit log — "разбор инцидента без
+ * ssh" (limits-audit.md §11). Separate from `ConsentStore` above: this is
+ * neither the plan nor the execute gate, just a read path over the same
+ * consent_audit table the gate already writes to. */
+interface AuditStore {
+  listConsentAudit(filters: ConsentAuditFilters, limit?: number, offset?: number): Promise<ConsentAuditRow[]>;
+  countConsentAudit(filters: ConsentAuditFilters): Promise<number>;
+}
+
+/** Context threaded into `registerSheetsTools`/`registerTriageTools` carrying
+ * the consent-gate wiring (ported from gmail-mcp's `GmailSnoozeContext`). */
+export interface SheetsConsentContext {
+  /** Consent-gate storage. null exactly when Postgres isn't configured —
+   * every gated write tool below refuses outright when this is null
+   * (gate.md §3.5: no durable manifest storage means no gate, and that must
+   * never become a silent bypass). */
+  consentStore: ConsentStore | null;
+  /** Gate knobs (TTL / anti-doublet gap / batch cap), always present even
+   * when consentStore is null so a refusal message can still be built
+   * without a crash. Real value comes from `consentServerConfig` in
+   * server.ts (env-driven). */
+  consentCfg: ConsentConfig;
+  /** Read-only access to the consent_audit log. null exactly when Postgres
+   * isn't configured (same honest-degradation rule as `consentStore`). */
+  auditStore: AuditStore | null;
+}
+
+/** Fallback gate config for callers that don't wire a real one (offline unit
+ * tests exercising other tools). Mirrors config.ts's `loadConsentGateConfig()`
+ * defaults; production always gets the real env-driven config from server.ts. */
+const DEFAULT_CONSENT_CFG: ConsentConfig = {
+  server: "sheets",
+  consentTtlMs: 3_600_000,
+  minConsentGapMs: 2_000,
+  sendBatchMax: 10,
+};
+
+const DEFAULT_CONSENT_CTX: SheetsConsentContext = {
+  consentStore: null,
+  consentCfg: DEFAULT_CONSENT_CFG,
+  auditStore: null,
+};
 
 /** "#RRGGBB" (or "RRGGBB") -> Sheets API color object. */
 function hexToColor(hex: string): sheets_v4.Schema$Color {
@@ -141,7 +223,321 @@ const cellValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const valuesField = z.array(z.array(cellValue)).describe("2D array of rows × columns.");
 const valueInputOptionField = z.enum(["USER_ENTERED", "RAW"]).default("USER_ENTERED").optional();
 
-export function registerSheetsTools(server: McpServer, clients: UserClients) {
+// ── Consent-gate machinery (mcp-development-standard/references/gate.md) ───
+// Ported from gmail-mcp's tools/gmail.ts: the same requireConsent/plan→execute
+// wiring, one §5.3 report renderer, and REAL (non-tautological) rehash for
+// every gated write below — each rehash re-reads the LIVE target (range
+// content / spreadsheet title / tab list / cell formatting) at execute time,
+// never `sha256(payload)` in disguise, except where noted (sheets_create has
+// no live object to bind against yet — same documented degenerate case as
+// gmail_send).
+
+type PostVerifyOutcome = "ok" | "warn" | "mismatch";
+interface VerifyLine {
+  outcome: PostVerifyOutcome;
+  line: string;
+}
+
+/** Now, formatted for America/Los_Angeles. */
+function nowInLA(): string {
+  return new Date().toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" }) + " America/Los_Angeles";
+}
+
+/** Worst outcome across a batch, for choosing the summary status header. */
+function worstOutcome(results: Array<{ outcome: PostVerifyOutcome }>): PostVerifyOutcome {
+  if (results.some((r) => r.outcome === "mismatch")) return "mismatch";
+  if (results.some((r) => r.outcome === "warn")) return "warn";
+  return "ok";
+}
+
+/** One §5.3 renderer for the whole file (output-format.md §7.1 p.5: "an
+ * instrument hand-rolling its own status string is a defect"). */
+function renderVerifyReport(title: string, subtitle: string, results: VerifyLine[]): string {
+  const okN = results.filter((r) => r.outcome === "ok").length;
+  const warnN = results.filter((r) => r.outcome === "warn").length;
+  const mmN = results.filter((r) => r.outcome === "mismatch").length;
+  const body = results.map((r) => r.line).join("\n");
+  return (
+    `### 🧾 ${title}\n` +
+    `_${nowInLA()} · ${subtitle}_\n\n` +
+    `${body}\n\n` +
+    `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**\n` +
+    `_[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — это серверная проверка, не заменяй пересказом]_`
+  );
+}
+
+/**
+ * Aggregates a gated batch mutation's per-item results with REAL independent
+ * post-verify reads: every item without an execute-time `error` gets a fresh
+ * `verify` read, the response header reflects the WORST outcome (never
+ * smoothed to ✅ on a ❌ — §5.3), and the audit row's phase-2 outcome is
+ * filled in via `updateConsentAuditOutcome` so `sheets_consent_audit` shows
+ * what actually happened, not just that the human said yes.
+ */
+async function buildMutationResult<T extends { error?: string }>(opts: {
+  results: T[];
+  total: number;
+  verb: string;
+  summaryIcon: string;
+  verify: (item: T) => Promise<VerifyLine>;
+  reportTitle: string;
+  reportSubtitle: string;
+  consentStore?: ConsentStore;
+  auditId?: string;
+  preSnapshot?: unknown;
+}): Promise<ReturnType<typeof ok>> {
+  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
+  const succeeded = results.filter((r) => !r.error);
+  const pv = await mapWithLimit(succeeded, (r) => verify(r));
+  const okN = succeeded.length;
+  const failN = total - okN;
+  const worst = worstOutcome(pv);
+  let icon = summaryIcon;
+  let tail = "";
+  if (worst === "mismatch") {
+    icon = "❌";
+    tail = " — РАСХОЖДЕНИЕ при проверке, см. отчёт";
+  } else if (worst === "warn" || failN > 0) {
+    icon = "⚠️";
+    if (failN > 0) tail = ` (${failN} с ошибкой)`;
+  }
+  if (consentStore && auditId) {
+    const errs = results
+      .filter((r): r is T & { error: string } => !!r.error)
+      .map((r) => r.error)
+      .join("; ");
+    await consentStore
+      .updateConsentAuditOutcome(auditId, {
+        outcome: okN > 0 ? "confirmed" : "failed",
+        postVerify:
+          `${icon} ${verb} ${okN}/${total}${tail}` + (pv.length ? ` · post-verify: ${pv.map((p) => p.line).join("; ")}` : ""),
+        error: errs || null,
+        ...(preSnapshot !== undefined ? { preSnapshot } : {}),
+      })
+      .catch((e) => {
+        console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e));
+      });
+  }
+  return ok({
+    summary: `${icon} ${verb} ${okN}/${total}${tail}`,
+    results,
+    ...(pv.length ? { verification: renderVerifyReport(reportTitle, reportSubtitle, pv) } : {}),
+  });
+}
+
+/** Live cell VALUES of an A1 range, or null if the read itself failed. Used
+ * both to build the pre-write pre-snapshot at plan time AND to re-read the
+ * same range at rehash/post-verify time — the identical function on both
+ * sides is what makes the binding a real drift check, not a tautology. */
+async function liveRangeValues(g: GoogleClients, spreadsheetId: string, range: string): Promise<unknown[][] | null> {
+  try {
+    const res = await g.sheets.spreadsheets.values.get({ spreadsheetId, range });
+    return res.data.values ?? [];
+  } catch {
+    return null; // range/tab may not exist yet — treated as "empty" by callers, not a hard failure
+  }
+}
+
+/** Live spreadsheet title, or null if unreadable (deleted/no access) — used
+ * for identity-guard/binding on tools whose target is a whole spreadsheet
+ * rather than a specific range (create/add_tab/append/raw_batch_update). */
+async function liveSpreadsheetTitle(g: GoogleClients, spreadsheetId: string): Promise<string | null> {
+  try {
+    const res = await g.sheets.spreadsheets.get({ spreadsheetId, fields: "properties.title" });
+    return res.data.properties?.title ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Live tab titles for a spreadsheet, or null if unreadable. */
+async function liveTabTitles(g: GoogleClients, spreadsheetId: string): Promise<string[] | null> {
+  try {
+    const res = await g.sheets.spreadsheets.get({ spreadsheetId, fields: "sheets.properties.title" });
+    return (res.data.sheets ?? []).map((s) => s.properties?.title ?? "").filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+/** Post-verify: re-reads a range and confirms it now holds the requested
+ * values (dimension + cell-by-cell compare against what was requested to
+ * write). A SEPARATE fresh read — never reuses the mutation call's own
+ * response as proof (§5.1 p.1). */
+async function postVerifyRangeWritten(
+  g: GoogleClients,
+  spreadsheetId: string,
+  range: string,
+  expected: unknown[][],
+): Promise<VerifyLine> {
+  const live = await liveRangeValues(g, spreadsheetId, range);
+  const label = safeText(range) || "(диапазон)";
+  if (live === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${label}»** — не удалось перепроверить (${safeText(spreadsheetId)})` };
+  }
+  const rows = Math.min(expected.length, live.length);
+  let mismatchAt: string | null = null;
+  for (let r = 0; r < rows && !mismatchAt; r++) {
+    const cols = Math.min(expected[r].length, live[r]?.length ?? 0);
+    for (let c = 0; c < cols; c++) {
+      // Sheets round-trips numbers/booleans as their live JS type but may
+      // stringify formulas/USER_ENTERED input — compare loosely via String().
+      if (String(expected[r][c] ?? "") !== String(live[r]?.[c] ?? "")) {
+        mismatchAt = `${String.fromCharCode(65 + c)}${r + 1}`;
+        break;
+      }
+    }
+  }
+  if (mismatchAt || live.length < expected.length) {
+    return {
+      outcome: "mismatch",
+      line: `- ❌ **«${label}»** — живое содержимое не совпадает с запрошенным${mismatchAt ? ` (расхождение у ${mismatchAt})` : " (меньше строк, чем записано)"}`,
+    };
+  }
+  return { outcome: "ok", line: `- ✅ **«${label}»** — записано, живое содержимое совпадает` };
+}
+
+/** Post-verify: re-reads a range and confirms it is now empty (or absent). */
+async function postVerifyRangeCleared(g: GoogleClients, spreadsheetId: string, range: string): Promise<VerifyLine> {
+  const live = await liveRangeValues(g, spreadsheetId, range);
+  const label = safeText(range) || "(диапазон)";
+  if (live === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${label}»** — не удалось перепроверить` };
+  }
+  const stillHasData = live.some((row) => row.some((c) => c !== "" && c != null));
+  if (stillHasData) {
+    return { outcome: "mismatch", line: `- ❌ **«${label}»** — в диапазоне всё ещё есть данные` };
+  }
+  return { outcome: "ok", line: `- ✅ **«${label}»** — диапазон пуст` };
+}
+
+/** Post-verify: spreadsheet still exists and its title matches (identity
+ * confirmation for whole-spreadsheet mutations: create/add_tab/append). */
+async function postVerifySpreadsheetIdentity(
+  g: GoogleClients,
+  spreadsheetId: string,
+  expectedTitle: string | null,
+  label: string,
+): Promise<VerifyLine> {
+  const title = await liveSpreadsheetTitle(g, spreadsheetId);
+  const lbl = safeText(label) || "(таблица)";
+  if (title === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить таблицу ${safeText(spreadsheetId)}` };
+  }
+  if (expectedTitle !== null && title !== expectedTitle) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — название таблицы изменилось: живое «${safeText(title)}»` };
+  }
+  return { outcome: "ok", line: `- ✅ **«${safeText(title) || lbl}»** — таблица существует` };
+}
+
+/** Post-verify: a tab with this title now exists in the spreadsheet. */
+async function postVerifyTabExists(g: GoogleClients, spreadsheetId: string, title: string): Promise<VerifyLine> {
+  const tabs = await liveTabTitles(g, spreadsheetId);
+  const lbl = safeText(title) || "(вкладка)";
+  if (tabs === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить список вкладок` };
+  }
+  if (!tabs.includes(title)) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — вкладки нет среди живых: ${tabs.map((t) => safeText(t, 40)).join(", ") || "(пусто)"}` };
+  }
+  return { outcome: "ok", line: `- ✅ **«${lbl}»** — вкладка существует` };
+}
+
+/** Post-verify: re-reads formatting of a range and confirms the requested
+ * fields now hold the requested values. */
+async function postVerifyFormatApplied(
+  g: GoogleClients,
+  spreadsheetId: string,
+  range: string,
+  expected: Partial<{
+    bold: boolean;
+    italic: boolean;
+    fontSize: number;
+    textColor: string;
+    backgroundColor: string;
+    horizontalAlignment: string;
+    verticalAlignment: string;
+    wrapStrategy: string;
+  }>,
+): Promise<VerifyLine> {
+  const label = safeText(range) || "(диапазон)";
+  try {
+    const res = await g.sheets.spreadsheets.get({
+      spreadsheetId,
+      ranges: [range],
+      includeGridData: true,
+      fields: "sheets(data(rowData(values(userEnteredFormat))))",
+    });
+    const cell = res.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values?.[0];
+    const fmt = cell?.userEnteredFormat;
+    const tf = fmt?.textFormat;
+    const mismatches: string[] = [];
+    if (expected.bold !== undefined && !!tf?.bold !== expected.bold) mismatches.push("bold");
+    if (expected.italic !== undefined && !!tf?.italic !== expected.italic) mismatches.push("italic");
+    if (expected.fontSize !== undefined && tf?.fontSize !== expected.fontSize) mismatches.push("fontSize");
+    if (mismatches.length) {
+      return { outcome: "mismatch", line: `- ❌ **«${label}»** — не совпало: ${mismatches.join(", ")}` };
+    }
+    return { outcome: "ok", line: `- ✅ **«${label}»** — форматирование применено` };
+  } catch {
+    return { outcome: "warn", line: `- ⚠️ **«${label}»** — не удалось перепроверить форматирование` };
+  }
+}
+
+/** Post-verify for `sheets_raw_batch_update`: content-level verification of an
+ * ARBITRARY batchUpdate request is not generically possible (honest limit,
+ * STANDARD §15.1 Q20 — must be named up front, always ⚠️). This only confirms
+ * the spreadsheet is still reachable after the call. */
+async function postVerifyRawBatchApplied(g: GoogleClients, spreadsheetId: string): Promise<VerifyLine> {
+  const title = await liveSpreadsheetTitle(g, spreadsheetId);
+  if (title === null) {
+    return { outcome: "warn", line: `- ⚠️ **(${safeText(spreadsheetId)})** — таблица недоступна после применения` };
+  }
+  return {
+    outcome: "warn",
+    line: `- ⚠️ **«${safeText(title)}»** — запрос применён без ошибки; произвольный batchUpdate нельзя обобщённо перепроверить по содержимому (честный предел, см. GUIDE.md)`,
+  };
+}
+
+/** Dry (non-mutating) find — same matching semantics as `sheets_find_replace`
+ * (literal substring, `matchCase`), returning every matching cell's address
+ * and CURRENT value. Used identically at plan time (to build the preview +
+ * pre-snapshot) and at rehash/post-verify time (to detect drift) — the
+ * shared function is what makes the binding real, not `sha256(payload)`. */
+async function dryFindMatches(
+  g: GoogleClients,
+  opts: { spreadsheetId: string; find: string; matchCase: boolean; sheetId?: number },
+): Promise<Array<{ sheet: string | null; sheetId: number | null; cell: string; value: string }>> {
+  const res = await g.sheets.spreadsheets.get({
+    spreadsheetId: opts.spreadsheetId,
+    includeGridData: true,
+    fields: "sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(formattedValue,effectiveValue,userEnteredValue))))",
+  });
+  const needle = opts.matchCase ? opts.find : opts.find.toLowerCase();
+  const found: Array<{ sheet: string | null; sheetId: number | null; cell: string; value: string }> = [];
+  for (const sheet of res.data.sheets ?? []) {
+    const sid = sheet.properties?.sheetId ?? null;
+    if (opts.sheetId !== undefined && sid !== opts.sheetId) continue;
+    const tab = sheet.properties?.title ?? null;
+    for (const gd of sheet.data ?? []) {
+      const startRow = gd.startRow ?? 0;
+      const startCol = gd.startColumn ?? 0;
+      for (const [ri, rowData] of (gd.rowData ?? []).entries()) {
+        for (const [ci, cell] of (rowData.values ?? []).entries()) {
+          const value = cellText(cell);
+          if (value === null || value === "") continue;
+          const hay = opts.matchCase ? value : value.toLowerCase();
+          if (!hay.includes(needle)) continue;
+          const colLetter = colIndexToLetters(startCol + ci);
+          found.push({ sheet: tab, sheetId: sid, cell: `${colLetter}${startRow + ri + 1}`, value });
+        }
+      }
+    }
+  }
+  return found;
+}
+
+export function registerSheetsTools(server: McpServer, clients: UserClients, ctx: SheetsConsentContext = DEFAULT_CONSENT_CTX) {
   const account = accountField(clients);
 
   // ── sheets_list ────────────────────────────────────────────────────────────
@@ -159,6 +555,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
           .describe("Only return spreadsheets whose name contains this text."),
         maxResults: z.number().int().min(1).max(200).default(50).optional(),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, nameContains, maxResults }) => {
       const g = clients.resolve(account);
@@ -194,6 +591,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
         account,
         spreadsheetIds: z.array(z.string()).min(1).describe("One or more spreadsheet IDs."),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, spreadsheetIds }) => {
       const g = clients.resolve(account);
@@ -242,6 +640,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
           )
           .min(1),
       },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, items }) => {
       const g = clients.resolve(account);
@@ -275,14 +674,42 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
   // to write several ranges. Items targeting the same spreadsheet are written
   // via batchUpdate in one call; different spreadsheets are written sequentially
   // (to avoid conflicts within a spreadsheet while allowing parallelism across them).
+  interface WriteRangeItem {
+    spreadsheetId: string;
+    range: string;
+    values: unknown[][];
+    valueInputOption?: "USER_ENTERED" | "RAW";
+  }
+  interface WriteRangePayload {
+    account: string;
+    items: WriteRangeItem[];
+  }
+
+  /** Binding surface: for EACH item, re-reads the range's CURRENT (pre-write)
+   * content live and returns {spreadsheetId, range, preValues}. Called
+   * identically at plan time (to seed objectHash + the pre-snapshot) and at
+   * execute time via `rehash` (to detect drift) — a concurrent edit to the
+   * range between plan and execute changes `preValues` and trips the binding
+   * mismatch (gate.md §3.3(2)); this is a REAL check, not `sha256(payload)`. */
+  async function writeRangeBindingSnapshot(g: GoogleClients, items: WriteRangeItem[]) {
+    return mapWithLimit(items, async (it) => ({
+      spreadsheetId: it.spreadsheetId,
+      range: it.range,
+      preValues: (await liveRangeValues(g, it.spreadsheetId, it.range)) ?? [],
+    }));
+  }
+
   server.registerTool(
     "sheets_write_range",
     {
       title: "Write range(s)",
       description:
-        "Overwrite cell values in one or more A1 ranges. " +
-        "Items for the same spreadsheet are batched into one API call. " +
-        "Items for different spreadsheets run sequentially. " +
+        "Overwrite cell values in one or more A1 ranges. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — NOTHING is written yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually write — the approved batch is read back from the plan, not from whatever " +
+        "`items` the second call carries. " +
         "`valueInputOption` USER_ENTERED parses formulas/numbers like the UI; RAW stores text verbatim.",
       inputSchema: {
         account,
@@ -295,25 +722,90 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
               valueInputOption: valueInputOptionField,
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Запись недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести запись через гейт подтверждения и поэтому не пишет — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
+      const accountName = account ?? clients.defaultName;
 
-      // Group by spreadsheetId
-      const byId = new Map<string, typeof items>();
-      for (const item of items) {
+      const decision = await requireConsent<WriteRangePayload>({
+        tool: "sheets_write_range",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план записи.");
+          }
+          const snapshot = await writeRangeBindingSnapshot(g, items);
+          const payload: WriteRangePayload = { account: accountName, items };
+          const lines = items.map((it, i) => {
+            const pre = snapshot[i].preValues;
+            const rows = it.values.length;
+            const cols = it.values.reduce((n, row) => Math.max(n, row.length), 0);
+            const preview = it.values
+              .slice(0, 3)
+              .map((row) => row.slice(0, 5).map((v) => safeText(String(v ?? ""), 30)).join(" | "))
+              .join(" / ");
+            return (
+              `- **«${safeText(it.spreadsheetId, 60)}»** ${safeText(it.range, 60)}: ${rows}×${cols} — ` +
+              `${safeText(preview, 200) || "(пусто)"}${it.values.length > 3 ? "…" : ""}` +
+              (pre.length ? ` _(сейчас в диапазоне ${pre.length} строк(и) — будут перезаписаны)_` : " _(диапазон сейчас пуст)_")
+            );
+          });
+          const preview = `### 📤 План: Запись в диапазон(ы) — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({
+            account: accountName,
+            items: snapshot.map((s) => ({ spreadsheetId: s.spreadsheetId, range: s.range, preValues: s.preValues })),
+          });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as WriteRangePayload;
+          const snapshot = await writeRangeBindingSnapshot(g, a.items);
+          return sha256({
+            account: a.account,
+            items: snapshot.map((s) => ({ spreadsheetId: s.spreadsheetId, range: s.range, preValues: s.preValues })),
+          });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const preSnapshot = await writeRangeBindingSnapshot(g, payload.items);
+
+      // Group by spreadsheetId (same batching strategy as before the gate).
+      const byId = new Map<string, WriteRangeItem[]>();
+      for (const item of payload.items) {
         const list = byId.get(item.spreadsheetId) ?? [];
         list.push(item);
         byId.set(item.spreadsheetId, list);
       }
-
       const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; updatedCells?: number | null; error?: string }> = [];
-
       for (const [spreadsheetId, group] of byId) {
         if (group.length === 1) {
-          // Single range — use values.update
           const { range, values, valueInputOption } = group[0];
           try {
             const res = await g.sheets.spreadsheets.values.update({
@@ -322,53 +814,77 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
               valueInputOption: valueInputOption ?? "USER_ENTERED",
               requestBody: { values },
             });
-            results.push({
-              spreadsheetId,
-              updatedRange: res.data.updatedRange ?? range,
-              updatedCells: res.data.updatedCells,
-            });
+            results.push({ spreadsheetId, range, updatedRange: res.data.updatedRange ?? range, updatedCells: res.data.updatedCells });
           } catch (e: unknown) {
             results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
           }
         } else {
-          // Multiple ranges — use values.batchUpdate
           const vio = group[0].valueInputOption ?? "USER_ENTERED";
           try {
             const res = await g.sheets.spreadsheets.values.batchUpdate({
               spreadsheetId,
-              requestBody: {
-                valueInputOption: vio,
-                data: group.map(({ range, values }) => ({ range, values })),
-              },
+              requestBody: { valueInputOption: vio, data: group.map(({ range, values }) => ({ range, values })) },
             });
-            for (const resp of res.data.responses ?? []) {
-              results.push({
-                spreadsheetId,
-                updatedRange: resp.updatedRange ?? undefined,
-                updatedCells: resp.updatedCells,
-              });
+            for (const [i, resp] of (res.data.responses ?? []).entries()) {
+              results.push({ spreadsheetId, range: group[i]?.range, updatedRange: resp.updatedRange ?? undefined, updatedCells: resp.updatedCells });
             }
           } catch (e: unknown) {
-            results.push({ spreadsheetId, error: String(e instanceof Error ? e.message : e) });
+            for (const it of group) results.push({ spreadsheetId, range: it.range, error: String(e instanceof Error ? e.message : e) });
           }
         }
       }
 
-      const ok_count = results.filter((r) => !r.error).length;
-      return ok({
-        summary: `Wrote ${ok_count}/${items.length} range(s)`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Written",
+        summaryIcon: "✏️",
+        verify: (r) => postVerifyRangeWritten(g, r.spreadsheetId, r.range!, payload.items.find((it) => it.spreadsheetId === r.spreadsheetId && it.range === r.range)?.values ?? []),
+        reportTitle: "Независимая проверка записи",
+        reportSubtitle: "запрошено ⇄ живое содержимое Google Sheets",
+        consentStore,
+        auditId,
+        preSnapshot,
       });
     }),
   );
 
   // ── sheets_append_rows ─────────────────────────────────────────────────────
+  // DEBATABLE (flagged per Maksim's "gate ALL write tools, no exceptions"
+  // decision — see the port report): this is additive-only (Sheets always
+  // appends past the end of existing data; it can't overwrite anything), so
+  // the risk profile is much closer to a read than to write_range/clear_range.
+  // Gated anyway per the standing rule; binding is weak-but-real (re-reads
+  // the spreadsheet's live title, catching rename/delete between plan and
+  // execute) rather than content-based, since "the end of the data" isn't a
+  // stable thing to bind against.
+  interface AppendRowsItem {
+    spreadsheetId: string;
+    range: string;
+    values: unknown[][];
+    valueInputOption?: "USER_ENTERED" | "RAW";
+  }
+  interface AppendRowsPayload {
+    account: string;
+    items: AppendRowsItem[];
+  }
+  async function appendBindingSnapshot(g: GoogleClients, items: AppendRowsItem[]) {
+    return mapWithLimit(items, async (it) => ({
+      spreadsheetId: it.spreadsheetId,
+      title: await liveSpreadsheetTitle(g, it.spreadsheetId),
+    }));
+  }
+
   server.registerTool(
     "sheets_append_rows",
     {
       title: "Append rows",
       description:
-        "Append rows to the end of data in one or more sheets. Items run sequentially per spreadsheet.",
+        "Append rows to the end of data in one or more sheets. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — nothing is appended yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually append.",
       inputSchema: {
         account,
         items: z
@@ -380,14 +896,67 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
               valueInputOption: valueInputOptionField,
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Добавление строк недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; error?: string }> = [];
+      const accountName = account ?? clients.defaultName;
 
-      for (const { spreadsheetId, range, values, valueInputOption } of items) {
+      const decision = await requireConsent<AppendRowsPayload>({
+        tool: "sheets_append_rows",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план добавления строк.");
+          }
+          const snapshot = await appendBindingSnapshot(g, items);
+          const payload: AppendRowsPayload = { account: accountName, items };
+          const lines = items.map((it, i) => {
+            const preview = it.values
+              .slice(0, 3)
+              .map((row) => row.slice(0, 5).map((v) => safeText(String(v ?? ""), 30)).join(" | "))
+              .join(" / ");
+            return `- **«${safeText(snapshot[i].title ?? it.spreadsheetId, 60)}»** ${safeText(it.range, 60)}: +${it.values.length} row(s) — ${safeText(preview, 200) || "(пусто)"}`;
+          });
+          const preview = `### 📤 План: Добавление строк — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items: snapshot });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as AppendRowsPayload;
+          const snapshot = await appendBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; error?: string }> = [];
+      for (const { spreadsheetId, range, values, valueInputOption } of payload.items) {
         try {
           const res = await g.sheets.spreadsheets.values.append({
             spreadsheetId,
@@ -396,30 +965,54 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
             insertDataOption: "INSERT_ROWS",
             requestBody: { values },
           });
-          results.push({
-            spreadsheetId,
-            updatedRange: res.data.updates?.updatedRange ?? range,
-          });
+          results.push({ spreadsheetId, range, updatedRange: res.data.updates?.updatedRange ?? range });
         } catch (e: unknown) {
           results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
         }
       }
 
-      const ok_count = results.filter((r) => !r.error).length;
-      return ok({
-        summary: `Appended to ${ok_count}/${items.length} range(s)`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Appended",
+        summaryIcon: "➕",
+        verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, null, r.updatedRange ?? r.spreadsheetId),
+        reportTitle: "Независимая проверка добавления строк",
+        reportSubtitle: "запрошено ⇄ живое состояние Google Sheets",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── sheets_clear_range ─────────────────────────────────────────────────────
+  interface ClearRangeItem {
+    spreadsheetId: string;
+    range: string;
+  }
+  interface ClearRangePayload {
+    account: string;
+    items: ClearRangeItem[];
+  }
+  async function clearBindingSnapshot(g: GoogleClients, items: ClearRangeItem[]) {
+    return mapWithLimit(items, async (it) => ({
+      spreadsheetId: it.spreadsheetId,
+      range: it.range,
+      preValues: (await liveRangeValues(g, it.spreadsheetId, it.range)) ?? [],
+    }));
+  }
+
   server.registerTool(
     "sheets_clear_range",
     {
       title: "Clear range",
       description:
-        "Clear values from one or more A1 ranges (keeps formatting). Items run sequentially.",
+        "Clear values from one or more A1 ranges (keeps formatting; irreversible once confirmed — the cleared " +
+        "content is only recoverable from the server's pre-mutation snapshot in the audit log, not undoable via " +
+        "this tool). Two-mode consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT " +
+        "`manifest_id`/`user_reply` (with `items`) to build a plan and return a preview of what would be erased " +
+        "— nothing is cleared yet. Show the preview to the user verbatim and wait for their reply. Call again " +
+        "with the returned `manifest_id` and the user's VERBATIM `user_reply` to actually clear.",
       inputSchema: {
         account,
         items: z
@@ -429,47 +1022,113 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
               range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:D20'."),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Очистка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results: Array<{ spreadsheetId: string; range?: string; clearedRange?: string; clearedRowCount?: number; error?: string }> = [];
+      const accountName = account ?? clients.defaultName;
 
-      for (const { spreadsheetId, range } of items) {
-        try {
-          let clearedValues: unknown[][] = [];
-          try {
-            const before = await g.sheets.spreadsheets.values.get({ spreadsheetId, range });
-            clearedValues = before.data.values ?? [];
-          } catch {
-            // If the read fails, still proceed with the clear.
+      const decision = await requireConsent<ClearRangePayload>({
+        tool: "sheets_clear_range",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план очистки.");
           }
-          const res = await g.sheets.spreadsheets.values.clear({ spreadsheetId, range });
-          results.push({
-            spreadsheetId,
-            clearedRange: res.data.clearedRange ?? range,
-            clearedRowCount: clearedValues.length,
+          const snapshot = await clearBindingSnapshot(g, items);
+          const payload: ClearRangePayload = { account: accountName, items };
+          const lines = snapshot.map((s) => {
+            const rowN = s.preValues.length;
+            const preview = s.preValues
+              .slice(0, 3)
+              .map((row) => row.slice(0, 5).map((v) => safeText(String(v ?? ""), 30)).join(" | "))
+              .join(" / ");
+            return `- **«${safeText(s.spreadsheetId, 60)}»** ${safeText(s.range, 60)} — сотрёт ${rowN} строк(и): ${safeText(preview, 200) || "(уже пусто)"}`;
           });
+          const preview = `### 📤 План: Очистка диапазона(ов) — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items: snapshot });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as ClearRangePayload;
+          const snapshot = await clearBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const preSnapshot = await clearBindingSnapshot(g, payload.items);
+      const results: Array<{ spreadsheetId: string; range?: string; clearedRange?: string; clearedRowCount?: number; error?: string }> = [];
+      for (const { spreadsheetId, range } of payload.items) {
+        try {
+          const before = preSnapshot.find((s) => s.spreadsheetId === spreadsheetId && s.range === range)?.preValues ?? [];
+          const res = await g.sheets.spreadsheets.values.clear({ spreadsheetId, range });
+          results.push({ spreadsheetId, range, clearedRange: res.data.clearedRange ?? range, clearedRowCount: before.length });
         } catch (e: unknown) {
           results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
         }
       }
 
-      const ok_count = results.filter((r) => !r.error).length;
-      return ok({
-        summary: `Cleared ${ok_count}/${items.length} range(s)`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Cleared",
+        summaryIcon: "🧹",
+        verify: (r) => postVerifyRangeCleared(g, r.spreadsheetId, r.range!),
+        reportTitle: "Независимая проверка очистки",
+        reportSubtitle: "запрошено ⇄ живое содержимое Google Sheets",
+        consentStore,
+        auditId,
+        preSnapshot,
       });
     }),
   );
 
   // ── sheets_create ──────────────────────────────────────────────────────────
+  interface CreateItem {
+    title: string;
+    sheetTitles?: string[];
+  }
+  interface CreatePayload {
+    account: string;
+    spreadsheets: CreateItem[];
+  }
+
   server.registerTool(
     "sheets_create",
     {
       title: "Create spreadsheet",
-      description: "Create one or more new spreadsheets. Returns per-item results.",
+      description:
+        "Create one or more new spreadsheets. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with " +
+        "`spreadsheets`) to build a plan and return a preview — nothing is created yet. Show the preview to the " +
+        "user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually create.",
       inputSchema: {
         account,
         spreadsheets: z
@@ -482,47 +1141,119 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
                 .describe("Optional list of tab names to create."),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, spreadsheets }) => {
+    guard(async ({ account, spreadsheets, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Создание недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<CreatePayload>({
+        tool: "sheets_create",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: () => {
+          if (!spreadsheets || !spreadsheets.length) {
+            throw new Error("Нужен непустой `spreadsheets`, чтобы построить план создания.");
+          }
+          const payload: CreatePayload = { account: accountName, spreadsheets };
+          const lines = spreadsheets.map(
+            (s) => `- **«${safeText(s.title, 120)}»**${s.sheetTitles?.length ? ` — вкладки: ${s.sheetTitles.map((t) => safeText(t, 40)).join(", ")}` : ""}`,
+          );
+          const preview = `### 📤 План: Создание таблиц — ${spreadsheets.length}\n\n${lines.join("\n")}`;
+          // Degenerate binding (documented exception, same as gmail_send in
+          // gmail-mcp/src/tools/gmail.ts): a spreadsheet that doesn't exist
+          // yet has no live object to re-read against — the only protection
+          // is that payload comes FROM the manifest, not the execute call's
+          // arguments (see consent.ts's contract comment on `rehash`).
+          return { payload, objectHash: sha256(payload), preview, batchSize: spreadsheets.length };
+        },
+        rehash: (addressing) => sha256(addressing),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
       const results = await Promise.all(
-        spreadsheets.map(async ({ title, sheetTitles }) => {
+        payload.spreadsheets.map(async ({ title, sheetTitles }) => {
           try {
             const res = await g.sheets.spreadsheets.create({
               requestBody: {
                 properties: { title },
-                sheets: sheetTitles?.length
-                  ? sheetTitles.map((t) => ({ properties: { title: t } }))
-                  : undefined,
+                sheets: sheetTitles?.length ? sheetTitles.map((t) => ({ properties: { title: t } })) : undefined,
               },
               fields: "spreadsheetId,spreadsheetUrl,properties.title",
             });
-            return {
-              spreadsheetId: res.data.spreadsheetId,
-              title: res.data.properties?.title ?? title,
-              spreadsheetUrl: res.data.spreadsheetUrl,
-            };
+            return { spreadsheetId: res.data.spreadsheetId ?? "", title: res.data.properties?.title ?? title, spreadsheetUrl: res.data.spreadsheetUrl };
           } catch (e: unknown) {
-            return { title, error: String(e instanceof Error ? e.message : e) };
+            return { spreadsheetId: "", title, error: String(e instanceof Error ? e.message : e) };
           }
         }),
       );
-      const ok_count = results.filter((r) => !("error" in r)).length;
-      return ok({
-        summary: `Created ${ok_count}/${spreadsheets.length} spreadsheet(s)`,
+
+      return buildMutationResult({
         results,
+        total: payload.spreadsheets.length,
+        verb: "Created",
+        summaryIcon: "📄",
+        verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, r.title, r.title),
+        reportTitle: "Независимая проверка создания",
+        reportSubtitle: "запрошено ⇄ живое состояние Google Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── sheets_add_tab ─────────────────────────────────────────────────────────
+  interface AddTabItem {
+    spreadsheetId: string;
+    title: string;
+  }
+  interface AddTabPayload {
+    account: string;
+    items: AddTabItem[];
+  }
+  async function addTabBindingSnapshot(g: GoogleClients, items: AddTabItem[]) {
+    return mapWithLimit(items, async (it) => ({
+      spreadsheetId: it.spreadsheetId,
+      title: it.title,
+      liveTitle: await liveSpreadsheetTitle(g, it.spreadsheetId),
+      liveTabs: (await liveTabTitles(g, it.spreadsheetId)) ?? [],
+    }));
+  }
+
   server.registerTool(
     "sheets_add_tab",
     {
       title: "Add a tab/sheet",
-      description: "Add one or more new tabs to existing spreadsheets. Items run sequentially.",
+      description:
+        "Add one or more new tabs to existing spreadsheets. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — nothing is added yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually add.",
       inputSchema: {
         account,
         items: z
@@ -532,85 +1263,293 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
               title: z.string().describe("Name of the new tab."),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Добавление вкладки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results: Array<{ spreadsheetId: string; sheetId?: number; title?: string; error?: string }> = [];
+      const accountName = account ?? clients.defaultName;
 
-      for (const { spreadsheetId, title } of items) {
+      const decision = await requireConsent<AddTabPayload>({
+        tool: "sheets_add_tab",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план добавления вкладки.");
+          }
+          const snapshot = await addTabBindingSnapshot(g, items);
+          const payload: AddTabPayload = { account: accountName, items };
+          const lines = snapshot.map(
+            (s) =>
+              `- **«${safeText(s.liveTitle ?? s.spreadsheetId, 60)}»** — новая вкладка «${safeText(s.title, 60)}»` +
+              (s.liveTabs.includes(s.title) ? " ⚠️ вкладка с таким именем уже есть" : ""),
+          );
+          const preview = `### 📤 План: Добавление вкладок — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items: snapshot.map(({ spreadsheetId, title, liveTitle, liveTabs }) => ({ spreadsheetId, title, liveTitle, liveTabs })) });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as AddTabPayload;
+          const snapshot = await addTabBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: snapshot.map(({ spreadsheetId, title, liveTitle, liveTabs }) => ({ spreadsheetId, title, liveTitle, liveTabs })) });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const results: Array<{ spreadsheetId: string; sheetId?: number; title?: string; error?: string }> = [];
+      for (const { spreadsheetId, title } of payload.items) {
         try {
           const res = await g.sheets.spreadsheets.batchUpdate({
             spreadsheetId,
             requestBody: { requests: [{ addSheet: { properties: { title } } }] },
           });
           const props = res.data.replies?.[0]?.addSheet?.properties;
-          results.push({
-            spreadsheetId,
-            sheetId: props?.sheetId ?? undefined,
-            title: props?.title ?? title,
-          });
+          results.push({ spreadsheetId, sheetId: props?.sheetId ?? undefined, title: props?.title ?? title });
         } catch (e: unknown) {
           results.push({ spreadsheetId, title, error: String(e instanceof Error ? e.message : e) });
         }
       }
 
-      const ok_count = results.filter((r) => !r.error).length;
-      return ok({
-        summary: `Added ${ok_count}/${items.length} tab(s)`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Added",
+        summaryIcon: "📑",
+        verify: (r) => postVerifyTabExists(g, r.spreadsheetId, r.title!),
+        reportTitle: "Независимая проверка добавления вкладки",
+        reportSubtitle: "запрошено ⇄ живой список вкладок",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── sheets_find_replace ────────────────────────────────────────────────────
+  interface FindReplacePayload {
+    account: string;
+    spreadsheetId: string;
+    find: string;
+    replace: string;
+    matchCase: boolean;
+    sheetId?: number;
+  }
+
   server.registerTool(
     "sheets_find_replace",
     {
       title: "Find & replace",
       description:
-        "Find and replace text across a spreadsheet (or a single sheet if sheetId is provided).",
+        "Find and replace text across a spreadsheet (or a single sheet if sheetId is provided). Two-mode " +
+        "consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` " +
+        "(with `find`/`replace`/etc.) to build a plan — this ONLY reads matching cells, it changes nothing. Show " +
+        "the returned preview (listing every cell that would change) to the user verbatim and wait for their " +
+        "reply. Call again with the returned `manifest_id` and the user's VERBATIM `user_reply` to actually replace.",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
-        find: z.string(),
-        replace: z.string(),
+        spreadsheetId: z.string().optional().describe("Required to build a plan. Ignored on the execute call."),
+        find: z.string().optional().describe("Required to build a plan. Ignored on the execute call."),
+        replace: z.string().optional().describe("Required to build a plan. Ignored on the execute call."),
         matchCase: z.boolean().default(false).optional(),
         sheetId: z
           .number()
           .int()
           .optional()
           .describe("Restrict to one sheet (numeric sheetId from sheets_get_info)."),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, spreadsheetId, find, replace, matchCase, sheetId }) => {
+    guard(async ({ account, spreadsheetId, find, replace, matchCase, sheetId, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Замена недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [
-            {
-              findReplace: {
-                find,
-                replacement: replace,
-                matchCase: matchCase ?? false,
-                allSheets: sheetId === undefined ? true : undefined,
-                sheetId,
-              },
-            },
-          ],
+      const accountName = account ?? clients.defaultName;
+      const mc = matchCase ?? false;
+
+      const decision = await requireConsent<FindReplacePayload>({
+        tool: "sheets_find_replace",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!spreadsheetId || find === undefined || replace === undefined) {
+            throw new Error("Нужны `spreadsheetId`, `find` и `replace`, чтобы построить план замены.");
+          }
+          const matches = await dryFindMatches(g, { spreadsheetId, find, matchCase: mc, sheetId });
+          const payload: FindReplacePayload = { account: accountName, spreadsheetId, find, replace, matchCase: mc, sheetId };
+          const lines = matches
+            .slice(0, 30)
+            .map((m) => `- ${safeText(m.sheet ?? "", 30)}!${m.cell}: «${safeText(m.value, 60)}» → «${safeText(m.value.split(find).join(replace), 60)}»`);
+          const preview =
+            `### 📤 План: Найти и заменить — ${matches.length} совпадение(й)\n\n` +
+            `«${safeText(find, 100)}» → «${safeText(replace, 100)}»${sheetId !== undefined ? ` (лист ${sheetId})` : " (все листы)"}\n\n` +
+            (lines.length ? lines.join("\n") + (matches.length > 30 ? `\n… и ещё ${matches.length - 30}` : "") : "_совпадений не найдено — заменять нечего_");
+          const objectHash = sha256({
+            spreadsheetId,
+            find,
+            replace,
+            matchCase: mc,
+            sheetId: sheetId ?? null,
+            matches: matches.map((m) => ({ sheet: m.sheet, cell: m.cell, value: m.value })),
+          });
+          return { payload, objectHash, preview, batchSize: Math.max(matches.length, 1) };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as FindReplacePayload;
+          const matches = await dryFindMatches(g, { spreadsheetId: a.spreadsheetId, find: a.find, matchCase: a.matchCase, sheetId: a.sheetId });
+          return sha256({
+            spreadsheetId: a.spreadsheetId,
+            find: a.find,
+            replace: a.replace,
+            matchCase: a.matchCase,
+            sheetId: a.sheetId ?? null,
+            matches: matches.map((m) => ({ sheet: m.sheet, cell: m.cell, value: m.value })),
+          });
         },
       });
-      const fr = res.data.replies?.[0]?.findReplace ?? {};
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const preMatches = await dryFindMatches(g, {
+        spreadsheetId: payload.spreadsheetId,
+        find: payload.find,
+        matchCase: payload.matchCase,
+        sheetId: payload.sheetId,
+      });
+      let fr: sheets_v4.Schema$FindReplaceResponse = {};
+      let execError: string | undefined;
+      try {
+        const res = await g.sheets.spreadsheets.batchUpdate({
+          spreadsheetId: payload.spreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                findReplace: {
+                  find: payload.find,
+                  replacement: payload.replace,
+                  matchCase: payload.matchCase,
+                  allSheets: payload.sheetId === undefined ? true : undefined,
+                  sheetId: payload.sheetId,
+                },
+              },
+            ],
+          },
+        });
+        fr = res.data.replies?.[0]?.findReplace ?? {};
+      } catch (e: unknown) {
+        execError = String(e instanceof Error ? e.message : e);
+      }
+
+      // Post-verify: re-read each previously-matched cell and confirm it no
+      // longer holds the old value (or, if find===replace, that it's unchanged).
+      const pv = await mapWithLimit(preMatches, async (m): Promise<VerifyLine> => {
+        const cellRange = `${m.sheet ? `'${m.sheet}'!` : ""}${m.cell}`;
+        const live = await liveRangeValues(g, payload.spreadsheetId, cellRange);
+        const liveVal = live?.[0]?.[0] != null ? String(live[0][0]) : "";
+        const expected = payload.matchCase
+          ? m.value.split(payload.find).join(payload.replace)
+          : m.value.replace(new RegExp(payload.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"), payload.replace);
+        if (live === null) return { outcome: "warn", line: `- ⚠️ **${safeText(m.cell)}** — не удалось перепроверить` };
+        if (payload.find === payload.replace) return { outcome: "ok", line: `- ✅ **${safeText(m.cell)}** — без изменений (find===replace)` };
+        if (liveVal === expected) return { outcome: "ok", line: `- ✅ **${safeText(m.cell)}** — «${safeText(liveVal, 60)}»` };
+        return { outcome: "mismatch", line: `- ❌ **${safeText(m.cell)}** — живое «${safeText(liveVal, 60)}», ожидалось «${safeText(expected, 60)}»` };
+      });
+      const worst = worstOutcome(pv);
+      const icon = execError ? "❌" : worst === "mismatch" ? "❌" : worst === "warn" ? "⚠️" : "🔁";
+      const summary = execError
+        ? `❌ Find&replace failed: ${execError}`
+        : `${icon} Replaced "${payload.find}" -> "${payload.replace}" — ${fr.occurrencesChanged ?? preMatches.length} occurrence(s)${payload.sheetId !== undefined ? ` (sheet ${payload.sheetId})` : " (all sheets)"}`;
+      if (consentStore && auditId) {
+        await consentStore
+          .updateConsentAuditOutcome(auditId, {
+            outcome: execError ? "failed" : "confirmed",
+            postVerify: summary + (pv.length ? ` · post-verify: ${pv.map((p) => p.line).join("; ")}` : ""),
+            error: execError ?? null,
+            preSnapshot: preMatches,
+          })
+          .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
+      }
       return ok({
-        summary: `Replaced "${find}" -> "${replace}" — ${fr.occurrencesChanged ?? 0} occurrence(s)${sheetId !== undefined ? ` (sheet ${sheetId})` : " (all sheets)"}`,
+        summary,
         findReplace: fr,
+        ...(pv.length ? { verification: renderVerifyReport("Независимая проверка замены", "запрошено ⇄ живое содержимое затронутых ячеек", pv) } : {}),
       });
     }),
   );
 
   // ── sheets_format_range ────────────────────────────────────────────────────
+  type FormatItem = {
+    spreadsheetId: string;
+    range: string;
+    bold?: boolean;
+    italic?: boolean;
+    fontSize?: number;
+    textColor?: string;
+    backgroundColor?: string;
+    horizontalAlignment?: "LEFT" | "CENTER" | "RIGHT";
+    verticalAlignment?: "TOP" | "MIDDLE" | "BOTTOM";
+    wrapStrategy?: "OVERFLOW_CELL" | "CLIP" | "WRAP";
+    numberFormatType?: "NUMBER" | "CURRENCY" | "PERCENT" | "DATE" | "TIME" | "DATE_TIME" | "TEXT" | "SCIENTIFIC";
+    numberFormatPattern?: string;
+  };
+  interface FormatRangePayload {
+    account: string;
+    items: FormatItem[];
+  }
+  async function formatBindingSnapshot(g: GoogleClients, items: FormatItem[]) {
+    return mapWithLimit(items, async (it) => {
+      try {
+        const res = await g.sheets.spreadsheets.get({
+          spreadsheetId: it.spreadsheetId,
+          ranges: [it.range],
+          includeGridData: true,
+          fields: "sheets(data(rowData(values(userEnteredFormat))))",
+        });
+        const cell = res.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values?.[0];
+        return { spreadsheetId: it.spreadsheetId, range: it.range, currentFormat: summariseFormat(cell?.userEnteredFormat) };
+      } catch {
+        return { spreadsheetId: it.spreadsheetId, range: it.range, currentFormat: null };
+      }
+    });
+  }
+
   server.registerTool(
     "sheets_format_range",
     {
@@ -618,7 +1557,11 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
       description:
         "Apply common cell formatting to one or more A1 ranges without hand-writing batchUpdate JSON: " +
         "bold/italic, font size, text & background colour (#RRGGBB), alignment, number format, text wrap. " +
-        "Pass only the options you want to change. Items run sequentially.",
+        "Pass only the options you want to change. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — nothing is formatted yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually format.",
       inputSchema: {
         account,
         items: z
@@ -643,14 +1586,78 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
                 .describe("e.g. '#,##0.00', '0.0%', 'dd.mm.yyyy', '$#,##0'."),
             }),
           )
-          .min(1),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Форматирование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<FormatRangePayload>({
+        tool: "sheets_format_range",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план форматирования.");
+          }
+          const snapshot = await formatBindingSnapshot(g, items);
+          const payload: FormatRangePayload = { account: accountName, items };
+          const lines = items.map((it) => {
+            const changes = [
+              it.bold !== undefined ? `bold=${it.bold}` : null,
+              it.italic !== undefined ? `italic=${it.italic}` : null,
+              it.fontSize !== undefined ? `fontSize=${it.fontSize}` : null,
+              it.textColor ? `textColor=${it.textColor}` : null,
+              it.backgroundColor ? `backgroundColor=${it.backgroundColor}` : null,
+              it.horizontalAlignment ?? null,
+              it.verticalAlignment ?? null,
+              it.wrapStrategy ?? null,
+              it.numberFormatPattern ?? it.numberFormatType ?? null,
+            ]
+              .filter(Boolean)
+              .join(", ");
+            return `- **«${safeText(it.spreadsheetId, 60)}»** ${safeText(it.range, 60)}: ${changes || "(нет изменений)"}`;
+          });
+          const preview = `### 📤 План: Форматирование — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items: snapshot });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as FormatRangePayload;
+          const snapshot = await formatBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const approvedItems = payload.items;
       const results: Array<{ spreadsheetId: string; range: string; applied?: number; error?: string }> = [];
 
-      for (const item of items) {
+      for (const item of approvedItems) {
         const {
           spreadsheetId, range, bold, italic, fontSize, textColor,
           backgroundColor, horizontalAlignment, verticalAlignment, wrapStrategy,
@@ -705,39 +1712,150 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
         }
       }
 
-      const ok_count = results.filter((r) => !r.error).length;
-      return ok({
-        summary: `Formatted ${ok_count}/${items.length} range(s)`,
+      return buildMutationResult({
         results,
+        total: approvedItems.length,
+        verb: "Formatted",
+        summaryIcon: "🎨",
+        verify: (r) => {
+          const it = approvedItems.find((x) => x.spreadsheetId === r.spreadsheetId && x.range === r.range)!;
+          return postVerifyFormatApplied(g, r.spreadsheetId, r.range, {
+            bold: it.bold,
+            italic: it.italic,
+            fontSize: it.fontSize,
+          });
+        },
+        reportTitle: "Независимая проверка форматирования",
+        reportSubtitle: "запрошено ⇄ живое форматирование Google Sheets",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── sheets_raw_batch_update ────────────────────────────────────────────────
+  // Most dangerous write tool in this file (arbitrary Sheets API requests) —
+  // explicit P1 in the port plan. Binding is necessarily weaker than the
+  // content-based tools above: `requests` is an opaque bag of API operations
+  // (merges, conditional formatting, sheet deletes, protected ranges…) with
+  // no generic "current state" to diff against. What CAN be bound for real is
+  // the spreadsheet's own identity (title) — re-read live at both plan and
+  // execute time — which at least catches "wrong/renamed/deleted spreadsheet"
+  // drift; `requests` itself rides along from the manifest unmodified (same
+  // as gmail_send's message body: protected by "payload comes from the
+  // manifest, not the execute call's arguments", not by content-diffing).
+  // Post-verify is honestly ALWAYS ⚠️ (STANDARD §15.1 Q20: an operation where
+  // generic post-verify is technically impossible must be named up front) —
+  // see postVerifyRawBatchApplied above and GUIDE.md.
+  interface RawBatchPayload {
+    account: string;
+    spreadsheetId: string;
+    requests: object[];
+  }
+
   server.registerTool(
     "sheets_raw_batch_update",
     {
       title: "Raw batchUpdate (advanced)",
       description:
-        "Send raw Sheets API batchUpdate `requests` (formatting, merges, conditional formatting, etc.). Use only when other tools are not enough. See the Sheets API Request schema.",
+        "Send raw Sheets API batchUpdate `requests` (formatting, merges, conditional formatting, etc.). Use only " +
+        "when other tools are not enough. See the Sheets API Request schema. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with " +
+        "`spreadsheetId`/`requests`) to build a plan and return a preview — nothing is applied yet. Show the " +
+        "preview to the user verbatim and wait for their reply. Call again with the returned `manifest_id` and " +
+        "the user's VERBATIM `user_reply` to actually apply. Post-verify for this tool is always ⚠️ — arbitrary " +
+        "requests have no generically checkable target state (honest limit, see GUIDE.md).",
       inputSchema: {
         account,
-        spreadsheetId: z.string(),
+        spreadsheetId: z.string().optional().describe("Required to build a plan. Ignored on the execute call."),
         requests: z
           .array(z.record(z.string(), z.any()))
-          .describe("Array of Sheets API Request objects."),
+          .optional()
+          .describe(
+            "Array of Sheets API Request objects. Required to build a plan (first call, no manifest_id/user_reply). " +
+              "Ignored on the execute call — the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, spreadsheetId, requests }) => {
+    guard(async ({ account, spreadsheetId, requests, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Raw batchUpdate недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const res = await g.sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: { requests: requests as object[] },
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<RawBatchPayload>({
+        tool: "sheets_raw_batch_update",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!spreadsheetId || !requests || !requests.length) {
+            throw new Error("Нужны `spreadsheetId` и непустой `requests`, чтобы построить план.");
+          }
+          const title = await liveSpreadsheetTitle(g, spreadsheetId);
+          const payload: RawBatchPayload = { account: accountName, spreadsheetId, requests: requests as object[] };
+          const kinds = (requests as object[]).map((r) => Object.keys(r)[0] ?? "?").join(", ");
+          const preview =
+            `### 📤 План: Raw batchUpdate — ${requests.length} request(s)\n\n` +
+            `- **«${safeText(title ?? spreadsheetId, 80)}»** — типы запросов: ${safeText(kinds, 200)}\n` +
+            `- ⚠️ произвольный batchUpdate — сервер не может обобщённо показать точное содержимое изменений, только их тип и число`;
+          const objectHash = sha256({ spreadsheetId, title, requests: payload.requests });
+          return { payload, objectHash, preview, batchSize: requests.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as RawBatchPayload;
+          const title = await liveSpreadsheetTitle(g, a.spreadsheetId);
+          return sha256({ spreadsheetId: a.spreadsheetId, title, requests: a.requests });
+        },
       });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      let replies: sheets_v4.Schema$Response[] | undefined;
+      let execError: string | undefined;
+      try {
+        const res = await g.sheets.spreadsheets.batchUpdate({
+          spreadsheetId: payload.spreadsheetId,
+          requestBody: { requests: payload.requests },
+        });
+        replies = res.data.replies ?? undefined;
+      } catch (e: unknown) {
+        execError = String(e instanceof Error ? e.message : e);
+      }
+      const verify = await postVerifyRawBatchApplied(g, payload.spreadsheetId);
+      const icon = execError ? "❌" : "⚠️"; // always ⚠️ on success — honest limit, see postVerifyRawBatchApplied
+      const summary = execError
+        ? `❌ Raw batchUpdate failed: ${execError}`
+        : `${icon} Applied ${payload.requests.length} raw request(s) to spreadsheet`;
+      if (consentStore && auditId) {
+        await consentStore
+          .updateConsentAuditOutcome(auditId, {
+            outcome: execError ? "failed" : "confirmed",
+            postVerify: `${summary} · ${verify.line}`,
+            error: execError ?? null,
+          })
+          .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
+      }
       return ok({
-        summary: `Applied ${requests.length} raw request(s) to spreadsheet`,
-        spreadsheetId: res.data.spreadsheetId,
-        replies: res.data.replies,
+        summary,
+        spreadsheetId: payload.spreadsheetId,
+        replies,
+        verification: renderVerifyReport("Независимая проверка raw batchUpdate", "запрошено ⇄ доступность таблицы (содержимое не проверяется — честный предел)", [verify]),
       });
     }),
   );
@@ -922,6 +2040,106 @@ export function registerSheetsTools(server: McpServer, clients: UserClients) {
         truncated,
         matches: found,
       });
+    }),
+  );
+
+  // ── sheets_consent_audit ───────────────────────────────────────────────────
+  // "Разбор инцидента без ssh" (limits-audit.md §11) — ported from gmail-mcp's
+  // gmail_consent_audit. Read-only path over the same consent_audit table the
+  // gate writes to; answers "what did the consent gate actually decide" and
+  // "did it block anything today" without reading server logs.
+
+  server.registerTool(
+    "sheets_consent_audit",
+    {
+      title: "Read the consent-gate audit log",
+      description:
+        "Read-only log of every decision the consent gate has made for the gated sheets_* write tools " +
+        "(sheets_write_range/clear_range/append_rows/create/add_tab/find_replace/format_range/raw_batch_update) " +
+        "and triage_log_add/triage_log_update: plan built, confirmed, refused, or invalidated, plus — once the " +
+        "mutation actually ran — its outcome and post-verify result. This is how to answer \"what actually " +
+        "happened to that range\" or \"did the gate block anything today\" without reading server logs. " +
+        "Filter by `since`/`until` (ISO 8601), `account`, `tool`, or `outcome` " +
+        "(confirmed/refused/invalidated/failed — a manifest that's only been planned and never answered has no " +
+        "audit row yet, nothing to show). Results are newest first, capped at 100 per page " +
+        "(default 20); use `offset` to page through older rows. External text (the verbatim user_reply and the " +
+        "outbound pre-snapshot) is shown neutralised, never as live markdown.",
+      inputSchema: {
+        account: z
+          .string()
+          .optional()
+          .describe("Filter to one account label. Omit to show all accounts, not just the default."),
+        since: z.string().optional().describe("ISO 8601 datetime — only rows at or after this time."),
+        until: z.string().optional().describe("ISO 8601 datetime — only rows at or before this time."),
+        tool: z
+          .string()
+          .optional()
+          .describe("Filter to one tool name, e.g. 'sheets_write_range'. Omit to show every gated tool."),
+        outcome: z
+          .enum(["confirmed", "refused", "invalidated", "failed"])
+          .optional()
+          .describe("Filter to one outcome. Omit to show all."),
+        limit: z.number().int().min(1).max(100).default(20).optional().describe("Max rows to return (1-100, default 20)."),
+        offset: z.number().int().min(0).default(0).optional().describe("Skip this many newest-first rows — for paging past the first `limit`."),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ account, since, until, tool, outcome, limit, offset }) => {
+      const { auditStore, consentCfg } = ctx;
+      if (!auditStore) {
+        return ok({
+          summary: "Audit log unavailable — DATABASE_URL is not configured, so nothing has been recorded.",
+          results: [],
+        });
+      }
+      const parseWhen = (label: string, s?: string): number | undefined => {
+        if (!s) return undefined;
+        const t = Date.parse(s);
+        if (Number.isNaN(t)) throw new Error(`Cannot parse ${label}="${s}". Use ISO 8601, e.g. 2026-08-04T00:00:00-07:00.`);
+        return t;
+      };
+      const filters = {
+        server: consentCfg.server,
+        since: parseWhen("since", since),
+        until: parseWhen("until", until),
+        accountLabel: account?.trim() || undefined,
+        tool: tool?.trim() || undefined,
+        outcome,
+      };
+      const cap = limit ?? 20;
+      const off = offset ?? 0;
+      const [rows, total] = await Promise.all([
+        auditStore.listConsentAudit(filters, cap, off),
+        auditStore.countConsentAudit(filters),
+      ]);
+
+      const outcomeIcon = (o: string): string =>
+        o === "confirmed" ? "✅" : o === "failed" ? "❌" : o === "refused" || o === "invalidated" ? "🛑" : "•";
+
+      const header = "| Время (PT) | Инструмент | Аккаунт | Actor | Исход | user_reply | post-verify | Детали |";
+      const sep = "|---|---|---|---|---|---|---|---|";
+      const lines = rows.map((r) => {
+        const details = r.error
+          ? `ошибка: ${safeText(r.error, 80)}`
+          : r.preSnapshot
+            ? `снимок: ${safeText(JSON.stringify(r.preSnapshot), 100)}`
+            : "—";
+        return (
+          `| ${formatLaTime(r.ts)} | ${r.tool} | ${r.accountLabel} | ${r.actor} | ` +
+          `${outcomeIcon(r.outcome)} ${r.outcome} | ${safeText(r.userReply, 60) || "—"} | ` +
+          `${safeText(r.postVerifyResult ?? "", 60) || "—"} | ${details} |`
+        );
+      });
+
+      const shownNote =
+        total > off + rows.length
+          ? `Показано ${rows.length} из ${total} (записи ${off + 1}–${off + rows.length}); ` +
+            `есть ещё — вызовите снова с offset=${off + rows.length}.`
+          : `Показано ${rows.length} из ${total}.`;
+
+      const body = rows.length ? [header, sep, ...lines].join("\n") : "Нет записей, подходящих под фильтры.";
+
+      return ok(`### 🧾 Журнал согласий\n\n${shownNote}\n\n${body}`);
     }),
   );
 }
