@@ -116,9 +116,17 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
 
       /** Live last-used ID (real, non-tautological binding: a concurrent
        * triage_log_add between plan and execute bumps this, tripping the
-       * binding mismatch — gate.md §3.3(2)). */
+       * binding mismatch — gate.md §3.3(2)).
+       *
+       * READ-ONLY on purpose: `plan` (gate.md §3.1) and `rehash` (§3.3 p.2) are
+       * both called on paths that must not mutate before consent — `plan` runs
+       * in the plan phase itself, `rehash` runs for the binding check before the
+       * one-shot consume. Header creation used to live here (`ensureHeader`),
+       * which meant a `values.update` could fire during `plan()`, i.e. before
+       * the user ever confirmed — a write past the gate. Header creation now
+       * happens once, explicitly, only after `decision.kind === "confirmed"`
+       * (see below), right before the actual `values.append`. */
       const liveLastId = async (): Promise<number> => {
-        await ensureHeader(g);
         const all = await readAllRows(g);
         return all.slice(1).reduce((max, row) => {
           const n = parseInt(row[0] ?? "0", 10);
@@ -157,6 +165,9 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
+      // Header write happens here — execute phase, strictly AFTER consent was
+      // confirmed (decision.kind === "confirmed") — never during plan().
+      await ensureHeader(g);
       const newRows = payload.rows.map((r, i) => [
         String(payload.lastId + i + 1),
         payload.today,

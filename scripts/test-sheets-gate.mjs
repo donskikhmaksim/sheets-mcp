@@ -182,5 +182,183 @@ console.log("\n[3] sheets_clear_range: user says 'нет' → 🛑 отмене�
   check("data STILL untouched", world.ranges.get("S1").get("Sheet1!A1")[0][0] === "precious data");
 }
 
+// ── triage.ts fixture: row-addressed fake, tracks EVERY write call ──────────
+// (accept-review finding, 2026-08-04: `ensureHeader()` used to fire a
+// `values.update` from inside `plan()` — a write during the PLAN phase, before
+// consent. Fixed in src/tools/triage.ts: header write moved to happen only
+// after `decision.kind === "confirmed"`. These tests are the regression guard:
+// they assert the write-call counter is exactly 0 after the plan-phase call,
+// for BOTH gated triage tools.)
+
+const TRIAGE_HEADER = ["ID", "Date", "Account", "From", "Subject", "Claude Suggested", "Maksim Said", "Why Not Closed", "Status"];
+
+function colLetterToIndex(letters) {
+  let n = 0;
+  for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1; // 0-based
+}
+function parseA1(ref) {
+  const m = /^([A-Z]+)(\d+)?$/.exec(ref);
+  return { col: colLetterToIndex(m[1]), row: m[2] ? parseInt(m[2], 10) - 1 : null };
+}
+function parseRange(full) {
+  const rest = full.slice(full.indexOf("!") + 1);
+  const [a, b] = rest.split(":");
+  const start = parseA1(a);
+  const end = b ? parseA1(b) : start;
+  return { start, end };
+}
+
+function makeTriageWorld() {
+  return { rows: [], writeOps: [] }; // rows[0] = header once written; writeOps logs every mutating call
+}
+
+function buildTriageClients(world) {
+  return {
+    names: ["work"],
+    defaultName: "work",
+    multi: false,
+    resolve: () => ({
+      sheets: {
+        spreadsheets: {
+          values: {
+            get: async ({ range }) => {
+              const { start, end } = parseRange(range);
+              const rowStart = start.row ?? 0;
+              const rowEnd = end.row ?? Math.max(world.rows.length - 1, -1);
+              const slice = world.rows
+                .slice(rowStart, rowEnd + 1)
+                .map((r) => (r ?? []).slice(start.col, end.col + 1));
+              // Real Sheets API omits trailing rows that were never written.
+              while (slice.length && slice[slice.length - 1].every((c) => c === undefined)) slice.pop();
+              return { data: { values: slice.length ? slice.map((r) => r.map((c) => c ?? "")) : [] } };
+            },
+            update: async ({ range, requestBody }) => {
+              const { start } = parseRange(range);
+              requestBody.values.forEach((rowVals, i) => {
+                const r = start.row + i;
+                world.rows[r] = world.rows[r] ?? [];
+                rowVals.forEach((v, j) => { world.rows[r][start.col + j] = v; });
+              });
+              world.writeOps.push({ op: "update", range });
+              return { data: { updatedRange: range } };
+            },
+            append: async ({ range, requestBody }) => {
+              requestBody.values.forEach((rowVals) => world.rows.push([...rowVals]));
+              world.writeOps.push({ op: "append", range });
+              return { data: { updates: { updatedRange: range } } };
+            },
+            batchUpdate: async ({ requestBody }) => {
+              for (const item of requestBody.data) {
+                const { start } = parseRange(item.range);
+                world.rows[start.row] = world.rows[start.row] ?? [];
+                item.values[0].forEach((v, j) => { world.rows[start.row][start.col + j] = v; });
+                world.writeOps.push({ op: "batchUpdate", range: item.range });
+              }
+              return { data: {} };
+            },
+          },
+        },
+      },
+      drive: { files: { list: async () => ({ data: { files: [] } }) } },
+    }),
+    baseGmailQuery: () => "",
+  };
+}
+
+async function triageHarness(world) {
+  const clients = buildTriageClients(world);
+  const manifests = new Map();
+  const audits = [];
+  const consentStore = {
+    async createManifest(input) {
+      manifests.set(input.id, { ...input, status: "AWAITING_CONSENT", consumedAt: null, userReply: null });
+    },
+    async getManifest(id, server) {
+      const r = manifests.get(id);
+      return r && r.server === server ? { ...r } : null;
+    },
+    async consumeManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (!r || r.server !== server || r.status !== "AWAITING_CONSENT") return null;
+      if (Date.now() >= r.expiresAt) return null;
+      r.status = "DONE";
+      r.userReply = userReply;
+      return { ...r };
+    },
+    async invalidateManifest(id, server, userReply) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") {
+        r.status = "INVALIDATED";
+        r.userReply = userReply;
+      }
+    },
+    async appendConsentAudit(entry) { audits.push({ ...entry }); },
+    async updateConsentAuditOutcome(auditId, outcome) {
+      const a = audits.find((x) => x.id === auditId);
+      if (a) Object.assign(a, outcome);
+    },
+  };
+  const consentCtx = { consentStore, consentCfg: { server: "sheets", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 }, auditStore: null };
+  const server = new McpServer({ name: "triage-gate-e2e", version: "0" });
+  registerAccountTools(server, clients);
+  registerTriageTools(server, clients, consentCtx);
+  const cli = new Client({ name: "c", version: "0" });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(b), cli.connect(a)]);
+  return { cli, world };
+}
+
+// ── [4] triage_log_add: plan() is strictly read-only, header write deferred ─
+console.log("\n[4] triage_log_add: plan phase does ZERO writes (accept-review regression — ensureHeader must not fire in plan())");
+{
+  const world = makeTriageWorld(); // fresh spreadsheet, no header yet — the exact case the review flagged
+  const { cli, world: w } = await triageHarness(world);
+
+  const planResp = await cli.callTool({
+    name: "triage_log_add",
+    arguments: { rows: [{ from: "a@b.com", subject: "Test subject", claudeSuggested: "archive" }] },
+  });
+  const planBody = text(planResp);
+  check("plan built a preview", planBody.includes("План: Добавление в Triage Log"), planBody.slice(0, 200));
+  check("plan phase performed ZERO write calls (no ensureHeader update, no append)", w.writeOps.length === 0, JSON.stringify(w.writeOps));
+  check("sheet still has no header after plan()", w.rows.length === 0, JSON.stringify(w.rows));
+  const manifestId = extractManifestId(planBody);
+  check("manifest id extracted", !!manifestId, planBody.slice(0, 200));
+
+  const execResp = await cli.callTool({ name: "triage_log_add", arguments: { manifest_id: manifestId, user_reply: "да" } });
+  const execBody = text(execResp);
+  check("execute succeeds with ✅", execBody.includes("✅"), execBody.slice(0, 120));
+  check("header written on execute, AFTER confirm", w.rows[0]?.[0] === "ID", JSON.stringify(w.rows[0]));
+  check("row appended on execute", w.rows[1]?.[3] === "a@b.com", JSON.stringify(w.rows[1]));
+  check("writes happened only on/after execute", w.writeOps.length > 0 && w.writeOps.some((o) => o.op === "update") && w.writeOps.some((o) => o.op === "append"));
+}
+
+// ── [5] triage_log_update: plan() is strictly read-only ──────────────────────
+console.log("\n[5] triage_log_update: plan phase does ZERO writes");
+{
+  const world = makeTriageWorld();
+  world.rows = [
+    TRIAGE_HEADER,
+    ["1", "2026-08-04", "work", "a@b.com", "Test subject", "archive", "", "", "pending"],
+  ];
+  const { cli, world: w } = await triageHarness(world);
+
+  const planResp = await cli.callTool({ name: "triage_log_update", arguments: { id: 1, status: "done" } });
+  const planBody = text(planResp);
+  check("plan built a preview", planBody.includes("План: Обновление Triage Log"), planBody.slice(0, 200));
+  check("plan phase performed ZERO write calls", w.writeOps.length === 0, JSON.stringify(w.writeOps));
+  const manifestId = extractManifestId(planBody);
+
+  // `id` is a required (non-optional) schema field on this tool — even on the
+  // execute call it must be passed, though the tool itself reads the actual
+  // payload back from the manifest, not from these arguments.
+  const execResp = await cli.callTool({ name: "triage_log_update", arguments: { id: 1, manifest_id: manifestId, user_reply: "да" } });
+  const execBody = text(execResp);
+  check("execute succeeds with ✅", execBody.includes("✅"), execBody.slice(0, 120));
+  check("status actually updated in the sheet", w.rows[1]?.[8] === "done", JSON.stringify(w.rows[1]));
+  check("writes happened only on/after execute", w.writeOps.length > 0);
+}
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);
