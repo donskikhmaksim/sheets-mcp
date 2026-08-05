@@ -10,9 +10,11 @@
  */
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { ok, fail, guard, safeText } from "../util.js";
-import type { UserClients } from "../accounts.js";
-import { requireConsent, sha256, USER_REPLY_DOC } from "../consent.js";
+import { getAutoExecuteClients, type UserClients } from "../accounts.js";
+import { requireConsent, sha256, USER_REPLY_DOC, type ConsentStore } from "../consent.js";
+import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 import type { SheetsConsentContext } from "./sheets.js";
 
 const SPREADSHEET_ID = "1o40fK-fF5Yh-y-iIGbYdvj8hiCKWzJ1yuJcBCA3NlYk";
@@ -39,6 +41,206 @@ async function readAllRows(g: ReturnType<UserClients["resolve"]>): Promise<strin
   return res.data.values ?? [];
 }
 
+// ── Payload shapes + module-level helpers for the gated tools below ─────────
+// Moved to module level (out of `registerTriageTools`'s per-request closure)
+// so the module-level auto-executors registered further down (Максим,
+// 2026-08-05 — Telegram-button auto-execute, see autoExecute.ts) can
+// reference them too — `registerAutoExecutor` runs once at import time.
+
+interface AddRow {
+  from: string;
+  subject: string;
+  claudeSuggested: string;
+  maksimSaid?: string;
+  whyNotClosed?: string;
+  status?: "pending" | "done";
+}
+interface AddPayload {
+  rows: AddRow[];
+  lastId: number;
+  today: string;
+}
+interface UpdatePayload {
+  id: number;
+  status?: "pending" | "done";
+  maksimSaid?: string;
+  whyNotClosed?: string;
+}
+
+/** Live last-used ID (real, non-tautological binding: a concurrent
+ * triage_log_add between plan and execute bumps this, tripping the binding
+ * mismatch — gate.md §3.3(2)). Hoisted from an inline closure inside
+ * triage_log_add's handler (it only ever took `g` and called module-level
+ * `readAllRows`, no other closure capture) so the module-level `rehash`
+ * registered via `registerAutoExecutor` can call it too. */
+async function liveLastId(g: ReturnType<UserClients["resolve"]>): Promise<number> {
+  const all = await readAllRows(g);
+  return all.slice(1).reduce((max, row) => {
+    const n = parseInt(row[0] ?? "0", 10);
+    return isNaN(n) ? max : Math.max(max, n);
+  }, 0);
+}
+
+/** Live snapshot of the target row's identity + current values — real
+ * binding (a concurrent edit/reorder between plan and execute changes this
+ * and trips the mismatch), and doubles as the pre-snapshot for the audit log.
+ * Hoisted from `registerTriageTools` (already took `g`/`id` as explicit
+ * params, no other closure capture). */
+async function liveRowSnapshot(g: ReturnType<UserClients["resolve"]>, id: number) {
+  const all = await readAllRows(g);
+  const idx = all.findIndex((row, i) => i > 0 && String(row[0]).trim() === String(id));
+  if (idx === -1) return null;
+  const row = all[idx];
+  return { sheetRow: idx + 1, from: row[3] ?? "", subject: row[4] ?? "", maksimSaid: row[6] ?? "", whyNotClosed: row[7] ?? "", status: row[8] ?? "" };
+}
+
+/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
+ * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn).
+ * Ported from gmail-mcp's tools/gmail.ts (same helper as tools/sheets.ts's). */
+function extractText(result: CallToolResult): string {
+  const first = result.content?.[0];
+  return first && first.type === "text" ? first.text : JSON.stringify(result);
+}
+
+// ── Auto-execute cores (Максим, 2026-08-05) ──────────────────────────────────
+// Same extraction pattern as tools/sheets.ts: pulled out of the tool body
+// (after `decision.kind === "confirmed"`), unchanged line-for-line, so both
+// the normal MCP handler and the Telegram-button auto-poller can call it.
+// triage tools always act on the SAME account (`userClients.defaultName` —
+// there is no per-call `account` argument, unlike tools/sheets.ts), so the
+// account used here is always `clients.defaultName` — no `account` field in
+// the payload to disambiguate.
+
+async function executeTriageLogAddCore(
+  g: ReturnType<UserClients["resolve"]>,
+  accountLabel: string,
+  payload: AddPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  // Header write happens here — execute phase, strictly AFTER consent was
+  // confirmed (decision.kind === "confirmed") — never during plan().
+  await ensureHeader(g);
+  const newRows = payload.rows.map((r, i) => [
+    String(payload.lastId + i + 1),
+    payload.today,
+    accountLabel,
+    r.from,
+    r.subject,
+    r.claudeSuggested,
+    r.maksimSaid ?? "",
+    r.whyNotClosed ?? "",
+    r.status ?? "pending",
+  ]);
+
+  await g.sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: RANGE,
+    valueInputOption: "RAW",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values: newRows },
+  });
+
+  const addedIds = newRows.map(r => Number(r[0]));
+  // Post-verify: re-read the log and confirm every added ID is now present
+  // with the expected subject (a SEPARATE fresh read, §5.1 p.1).
+  const after = await readAllRows(g);
+  const verified = addedIds.every((id) => after.some((row) => String(row[0]).trim() === String(id)));
+  const icon = verified ? "✅" : "⚠️";
+  await consentStore
+    .updateConsentAuditOutcome(auditId, {
+      outcome: "confirmed",
+      postVerify: `${icon} added IDs ${addedIds.join(", ")}${verified ? " — confirmed in sheet" : " — could not re-verify"}`,
+    })
+    .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
+  return ok({
+    summary: `${icon} Added ${newRows.length} row(s) to Triage Log (IDs: ${addedIds.join(", ")})`,
+    addedIds,
+    date: payload.today,
+  });
+}
+
+registerAutoExecutor("triage_log_add", {
+  rehash: async (addressing) => {
+    const a = addressing as AddPayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve();
+    const lastId = await liveLastId(g);
+    return sha256({ lastId, rows: a.rows });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as AddPayload;
+    const g = ctx.clients.resolve();
+    const result = await executeTriageLogAddCore(g, ctx.clients.defaultName, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+async function executeTriageLogUpdateCore(
+  g: ReturnType<UserClients["resolve"]>,
+  payload: UpdatePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const snap = await liveRowSnapshot(g, payload.id);
+  if (!snap) return fail(`Triage log entry with ID ${payload.id} not found (изменилось между планом и исполнением).`);
+
+  const data: { range: string; values: string[][] }[] = [];
+  if (payload.maksimSaid !== undefined)   data.push({ range: `${SHEET_NAME}!G${snap.sheetRow}`, values: [[payload.maksimSaid]] });
+  if (payload.whyNotClosed !== undefined) data.push({ range: `${SHEET_NAME}!H${snap.sheetRow}`, values: [[payload.whyNotClosed]] });
+  if (payload.status !== undefined)       data.push({ range: `${SHEET_NAME}!I${snap.sheetRow}`, values: [[payload.status]] });
+
+  await g.sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: { valueInputOption: "RAW", data },
+  });
+
+  // Post-verify: SEPARATE fresh read confirming the new values landed.
+  const after = await liveRowSnapshot(g, payload.id);
+  const mismatches = [
+    payload.status !== undefined && after?.status !== payload.status ? "status" : null,
+    payload.maksimSaid !== undefined && after?.maksimSaid !== payload.maksimSaid ? "maksimSaid" : null,
+    payload.whyNotClosed !== undefined && after?.whyNotClosed !== payload.whyNotClosed ? "whyNotClosed" : null,
+  ].filter(Boolean);
+  const icon = !after ? "⚠️" : mismatches.length ? "❌" : "✅";
+  await consentStore
+    .updateConsentAuditOutcome(auditId, {
+      outcome: mismatches.length ? "failed" : "confirmed",
+      postVerify: `${icon} #${payload.id}${mismatches.length ? ` — расхождение: ${mismatches.join(", ")}` : " — подтверждено"}`,
+      preSnapshot: snap,
+    })
+    .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
+
+  return ok({
+    summary: `${icon} Updated Triage Log #${payload.id}${payload.status ? ` → ${payload.status}` : ""}`,
+    id: payload.id,
+    sheetRow: snap.sheetRow,
+    updated: {
+      ...(payload.status !== undefined && { status: payload.status }),
+      ...(payload.maksimSaid !== undefined && { maksimSaid: payload.maksimSaid }),
+      ...(payload.whyNotClosed !== undefined && { whyNotClosed: payload.whyNotClosed }),
+    },
+  });
+}
+
+registerAutoExecutor("triage_log_update", {
+  rehash: async (addressing) => {
+    const a = addressing as UpdatePayload;
+    const clients = getAutoExecuteClients();
+    if (!clients) throw new Error("auto-execute: клиенты ещё не готовы");
+    const g = clients.resolve();
+    const snap = await liveRowSnapshot(g, a.id);
+    return sha256({ id: a.id, snap });
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as UpdatePayload;
+    const g = ctx.clients.resolve();
+    const result = await executeTriageLogUpdateCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
 const DEFAULT_TRIAGE_CTX: SheetsConsentContext = {
   consentStore: null,
   consentCfg: { server: "sheets", consentTtlMs: 3_600_000, minConsentGapMs: 2_000, sendBatchMax: 10 },
@@ -60,19 +262,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
   // about BLAST RADIUS (can't hit the wrong spreadsheet), not about content —
   // a wrong `claudeSuggested`/`maksimSaid` value can still be logged
   // incorrectly. Gated anyway per the standing rule.
-  interface AddRow {
-    from: string;
-    subject: string;
-    claudeSuggested: string;
-    maksimSaid?: string;
-    whyNotClosed?: string;
-    status?: "pending" | "done";
-  }
-  interface AddPayload {
-    rows: AddRow[];
-    lastId: number;
-    today: string;
-  }
+  // `AddRow`/`AddPayload` now live at module level (see above `registerTriageTools`).
 
   server.registerTool(
     "triage_log_add",
@@ -114,25 +304,8 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       }
       const g = userClients.resolve(ACCOUNT);
 
-      /** Live last-used ID (real, non-tautological binding: a concurrent
-       * triage_log_add between plan and execute bumps this, tripping the
-       * binding mismatch — gate.md §3.3(2)).
-       *
-       * READ-ONLY on purpose: `plan` (gate.md §3.1) and `rehash` (§3.3 p.2) are
-       * both called on paths that must not mutate before consent — `plan` runs
-       * in the plan phase itself, `rehash` runs for the binding check before the
-       * one-shot consume. Header creation used to live here (`ensureHeader`),
-       * which meant a `values.update` could fire during `plan()`, i.e. before
-       * the user ever confirmed — a write past the gate. Header creation now
-       * happens once, explicitly, only after `decision.kind === "confirmed"`
-       * (see below), right before the actual `values.append`. */
-      const liveLastId = async (): Promise<number> => {
-        const all = await readAllRows(g);
-        return all.slice(1).reduce((max, row) => {
-          const n = parseInt(row[0] ?? "0", 10);
-          return isNaN(n) ? max : Math.max(max, n);
-        }, 0);
-      };
+      // `liveLastId` now lives at module level (see above `registerTriageTools`)
+      // — needed by the module-level auto-executor's `rehash` too.
 
       const decision = await requireConsent<AddPayload>({
         tool: "triage_log_add",
@@ -146,7 +319,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
           if (!rows || !rows.length) {
             throw new Error("Нужен непустой `rows`, чтобы построить план добавления.");
           }
-          const lastId = await liveLastId();
+          const lastId = await liveLastId(g);
           const today = new Date().toISOString().slice(0, 10);
           const payload: AddPayload = { rows, lastId, today };
           const lines = rows.map(
@@ -157,7 +330,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
         },
         rehash: async (addressing) => {
           const a = addressing as AddPayload;
-          const lastId = await liveLastId();
+          const lastId = await liveLastId(g);
           return sha256({ lastId, rows: a.rows });
         },
       });
@@ -166,67 +339,13 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      // Header write happens here — execute phase, strictly AFTER consent was
-      // confirmed (decision.kind === "confirmed") — never during plan().
-      await ensureHeader(g);
-      const newRows = payload.rows.map((r, i) => [
-        String(payload.lastId + i + 1),
-        payload.today,
-        ACCOUNT,
-        r.from,
-        r.subject,
-        r.claudeSuggested,
-        r.maksimSaid ?? "",
-        r.whyNotClosed ?? "",
-        r.status ?? "pending",
-      ]);
-
-      await g.sheets.spreadsheets.values.append({
-        spreadsheetId: SPREADSHEET_ID,
-        range: RANGE,
-        valueInputOption: "RAW",
-        insertDataOption: "INSERT_ROWS",
-        requestBody: { values: newRows },
-      });
-
-      const addedIds = newRows.map(r => Number(r[0]));
-      // Post-verify: re-read the log and confirm every added ID is now present
-      // with the expected subject (a SEPARATE fresh read, §5.1 p.1).
-      const after = await readAllRows(g);
-      const verified = addedIds.every((id) => after.some((row) => String(row[0]).trim() === String(id)));
-      const icon = verified ? "✅" : "⚠️";
-      await consentStore
-        .updateConsentAuditOutcome(auditId, {
-          outcome: "confirmed",
-          postVerify: `${icon} added IDs ${addedIds.join(", ")}${verified ? " — confirmed in sheet" : " — could not re-verify"}`,
-        })
-        .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
-      return ok({
-        summary: `${icon} Added ${newRows.length} row(s) to Triage Log (IDs: ${addedIds.join(", ")})`,
-        addedIds,
-        date: payload.today,
-      });
+      return executeTriageLogAddCore(g, ACCOUNT, payload, auditId, consentStore);
     }),
   );
 
   // ── triage_log_update ──────────────────────────────────────────────────────
-  interface UpdatePayload {
-    id: number;
-    status?: "pending" | "done";
-    maksimSaid?: string;
-    whyNotClosed?: string;
-  }
-
-  /** Live snapshot of the target row's identity + current values — real
-   * binding (a concurrent edit/reorder between plan and execute changes this
-   * and trips the mismatch), and doubles as the pre-snapshot for the audit log. */
-  async function liveRowSnapshot(g: ReturnType<UserClients["resolve"]>, id: number) {
-    const all = await readAllRows(g);
-    const idx = all.findIndex((row, i) => i > 0 && String(row[0]).trim() === String(id));
-    if (idx === -1) return null;
-    const row = all[idx];
-    return { sheetRow: idx + 1, from: row[3] ?? "", subject: row[4] ?? "", maksimSaid: row[6] ?? "", whyNotClosed: row[7] ?? "", status: row[8] ?? "" };
-  }
+  // `UpdatePayload`/`liveRowSnapshot` now live at module level (see above
+  // `registerTriageTools`).
 
   server.registerTool(
     "triage_log_update",
@@ -296,45 +415,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const snap = await liveRowSnapshot(g, payload.id);
-      if (!snap) return fail(`Triage log entry with ID ${payload.id} not found (изменилось между планом и исполнением).`);
-
-      const data: { range: string; values: string[][] }[] = [];
-      if (payload.maksimSaid !== undefined)   data.push({ range: `${SHEET_NAME}!G${snap.sheetRow}`, values: [[payload.maksimSaid]] });
-      if (payload.whyNotClosed !== undefined) data.push({ range: `${SHEET_NAME}!H${snap.sheetRow}`, values: [[payload.whyNotClosed]] });
-      if (payload.status !== undefined)       data.push({ range: `${SHEET_NAME}!I${snap.sheetRow}`, values: [[payload.status]] });
-
-      await g.sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId: SPREADSHEET_ID,
-        requestBody: { valueInputOption: "RAW", data },
-      });
-
-      // Post-verify: SEPARATE fresh read confirming the new values landed.
-      const after = await liveRowSnapshot(g, payload.id);
-      const mismatches = [
-        payload.status !== undefined && after?.status !== payload.status ? "status" : null,
-        payload.maksimSaid !== undefined && after?.maksimSaid !== payload.maksimSaid ? "maksimSaid" : null,
-        payload.whyNotClosed !== undefined && after?.whyNotClosed !== payload.whyNotClosed ? "whyNotClosed" : null,
-      ].filter(Boolean);
-      const icon = !after ? "⚠️" : mismatches.length ? "❌" : "✅";
-      await consentStore
-        .updateConsentAuditOutcome(auditId, {
-          outcome: mismatches.length ? "failed" : "confirmed",
-          postVerify: `${icon} #${payload.id}${mismatches.length ? ` — расхождение: ${mismatches.join(", ")}` : " — подтверждено"}`,
-          preSnapshot: snap,
-        })
-        .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
-
-      return ok({
-        summary: `${icon} Updated Triage Log #${payload.id}${payload.status ? ` → ${payload.status}` : ""}`,
-        id: payload.id,
-        sheetRow: snap.sheetRow,
-        updated: {
-          ...(payload.status !== undefined && { status: payload.status }),
-          ...(payload.maksimSaid !== undefined && { maksimSaid: payload.maksimSaid }),
-          ...(payload.whyNotClosed !== undefined && { whyNotClosed: payload.whyNotClosed }),
-        },
-      });
+      return executeTriageLogUpdateCore(g, payload, auditId, consentStore);
     }),
   );
 
