@@ -15,6 +15,7 @@ import {
   type ConsentStore,
   type ConsentConfig,
   type ConsentPlan,
+  type TgApprovalGate,
 } from "../consent.js";
 
 /** One row of the shared consent_audit log, as read by `sheets_consent_audit`.
@@ -71,6 +72,9 @@ export interface SheetsConsentContext {
   /** Read-only access to the consent_audit log. null exactly when Postgres
    * isn't configured (same honest-degradation rule as `consentStore`). */
   auditStore: AuditStore | null;
+  /** Опциональный внеполосный ТГ-фактор (ported from gmail-mcp). undefined ⇒
+   * поведение гейта побайтово как до добавления TG-approval. */
+  tg?: TgApprovalGate;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -736,7 +740,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Запись недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -753,6 +757,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план записи.");
@@ -910,7 +915,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление строк недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -927,6 +932,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план добавления строк.");
@@ -1036,7 +1042,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Очистка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1053,6 +1059,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план очистки.");
@@ -1155,7 +1162,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, spreadsheets, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Создание недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1172,6 +1179,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: () => {
           if (!spreadsheets || !spreadsheets.length) {
             throw new Error("Нужен непустой `spreadsheets`, чтобы построить план создания.");
@@ -1277,7 +1285,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление вкладки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -1294,6 +1302,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план добавления вкладки.");
@@ -1388,7 +1397,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, spreadsheetId, find, replace, matchCase, sheetId, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Замена недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1406,6 +1415,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!spreadsheetId || find === undefined || replace === undefined) {
             throw new Error("Нужны `spreadsheetId`, `find` и `replace`, чтобы построить план замены.");
@@ -1600,7 +1610,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Форматирование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1617,6 +1627,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план форматирования.");
@@ -1784,7 +1795,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, spreadsheetId, requests, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Raw batchUpdate недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -1801,6 +1812,7 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!spreadsheetId || !requests || !requests.length) {
             throw new Error("Нужны `spreadsheetId` и непустой `requests`, чтобы построить план.");

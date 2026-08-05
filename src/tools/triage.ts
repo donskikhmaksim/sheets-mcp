@@ -105,7 +105,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       annotations: { destructiveHint: false },
     },
     guard(async ({ rows, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -141,6 +141,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!rows || !rows.length) {
             throw new Error("Нужен непустой `rows`, чтобы построить план добавления.");
@@ -251,7 +252,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       annotations: { destructiveHint: false, idempotentHint: true },
     },
     guard(async ({ id, status, maksimSaid, whyNotClosed, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Обновление недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -270,6 +271,7 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           const snap = await liveRowSnapshot(g, id);
           if (!snap) throw new Error(`Triage log entry with ID ${id} not found.`);
