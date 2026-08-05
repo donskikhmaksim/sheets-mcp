@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { sheets_v4 } from "googleapis";
-import { ok, fail, guard, safeText, mapWithLimit } from "../util.js";
+import { ok, fail, guard, safeText, mapWithLimit, withRetry } from "../util.js";
 import { accountField, getAutoExecuteClients, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import {
@@ -280,7 +280,7 @@ function renderVerifyReport(title: string, subtitle: string, results: VerifyLine
  * filled in via `updateConsentAuditOutcome` so `sheets_consent_audit` shows
  * what actually happened, not just that the human said yes.
  */
-async function buildMutationResult<T extends { error?: string }>(opts: {
+async function buildMutationResult<T extends { error?: string; spreadsheetId?: string }>(opts: {
   results: T[];
   total: number;
   verb: string;
@@ -291,10 +291,26 @@ async function buildMutationResult<T extends { error?: string }>(opts: {
   consentStore?: ConsentStore;
   auditId?: string;
   preSnapshot?: unknown;
+  /** Pass the account's Google client to annotate each result with the
+   * spreadsheet's human-readable `spreadsheetTitle` (output-format.md §7.1
+   * p.2: objects are shown by name, not raw id). Titles are fetched at most
+   * once per distinct `spreadsheetId` in this batch. Omit for tools whose
+   * results already carry the spreadsheet's own title verbatim (sheets_create
+   * — the title IS the input, re-fetching it would be redundant). */
+  g?: GoogleClients;
 }): Promise<ReturnType<typeof ok>> {
-  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
+  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot, g } = opts;
   const succeeded = results.filter((r) => !r.error);
   const pv = await mapWithLimit(succeeded, (r) => verify(r));
+  let outResults: unknown[] = results;
+  if (g) {
+    const titleCache: TitleCache = new Map();
+    outResults = await mapWithLimit(results, async (r) => {
+      const id = r.spreadsheetId;
+      const spreadsheetTitle = id ? await cachedSpreadsheetTitle(g, titleCache, id) : null;
+      return { ...r, spreadsheetTitle };
+    });
+  }
   const okN = succeeded.length;
   const failN = total - okN;
   const worst = worstOutcome(pv);
@@ -326,7 +342,7 @@ async function buildMutationResult<T extends { error?: string }>(opts: {
   }
   return ok({
     summary: `${icon} ${verb} ${okN}/${total}${tail}`,
-    results,
+    results: outResults,
     ...(pv.length ? { verification: renderVerifyReport(reportTitle, reportSubtitle, pv) } : {}),
   });
 }
@@ -354,6 +370,23 @@ async function liveSpreadsheetTitle(g: GoogleClients, spreadsheetId: string): Pr
   } catch {
     return null;
   }
+}
+
+/** A per-request cache for `liveSpreadsheetTitle`, so a batch of items that
+ * share a `spreadsheetId` (write_range/clear_range/append_rows/format_range/
+ * add_tab) fetch the spreadsheet's human-readable title at most once, not
+ * once per item. Callers create ONE cache per tool invocation (not module- or
+ * server-scoped — a stale title must never leak across requests) and pass it
+ * to `cachedSpreadsheetTitle`. */
+type TitleCache = Map<string, Promise<string | null>>;
+
+async function cachedSpreadsheetTitle(g: GoogleClients, cache: TitleCache, spreadsheetId: string): Promise<string | null> {
+  let p = cache.get(spreadsheetId);
+  if (!p) {
+    p = liveSpreadsheetTitle(g, spreadsheetId);
+    cache.set(spreadsheetId, p);
+  }
+  return p;
 }
 
 /** Live tab titles for a spreadsheet, or null if unreadable. */
@@ -716,12 +749,14 @@ async function executeWriteRangeCore(
     if (group.length === 1) {
       const { range, values, valueInputOption } = group[0];
       try {
-        const res = await g.sheets.spreadsheets.values.update({
-          spreadsheetId,
-          range,
-          valueInputOption: valueInputOption ?? "USER_ENTERED",
-          requestBody: { values },
-        });
+        const res = await withRetry(() =>
+          g.sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range,
+            valueInputOption: valueInputOption ?? "USER_ENTERED",
+            requestBody: { values },
+          }),
+        );
         results.push({ spreadsheetId, range, updatedRange: res.data.updatedRange ?? range, updatedCells: res.data.updatedCells });
       } catch (e: unknown) {
         results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
@@ -729,10 +764,12 @@ async function executeWriteRangeCore(
     } else {
       const vio = group[0].valueInputOption ?? "USER_ENTERED";
       try {
-        const res = await g.sheets.spreadsheets.values.batchUpdate({
-          spreadsheetId,
-          requestBody: { valueInputOption: vio, data: group.map(({ range, values }) => ({ range, values })) },
-        });
+        const res = await withRetry(() =>
+          g.sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId,
+            requestBody: { valueInputOption: vio, data: group.map(({ range, values }) => ({ range, values })) },
+          }),
+        );
         for (const [i, resp] of (res.data.responses ?? []).entries()) {
           results.push({ spreadsheetId, range: group[i]?.range, updatedRange: resp.updatedRange ?? undefined, updatedCells: resp.updatedCells });
         }
@@ -753,6 +790,7 @@ async function executeWriteRangeCore(
     consentStore,
     auditId,
     preSnapshot,
+    g,
   });
 }
 
@@ -785,13 +823,15 @@ async function executeAppendRowsCore(
   const results: Array<{ spreadsheetId: string; range?: string; updatedRange?: string; error?: string }> = [];
   for (const { spreadsheetId, range, values, valueInputOption } of payload.items) {
     try {
-      const res = await g.sheets.spreadsheets.values.append({
-        spreadsheetId,
-        range,
-        valueInputOption: valueInputOption ?? "USER_ENTERED",
-        insertDataOption: "INSERT_ROWS",
-        requestBody: { values },
-      });
+      const res = await withRetry(() =>
+        g.sheets.spreadsheets.values.append({
+          spreadsheetId,
+          range,
+          valueInputOption: valueInputOption ?? "USER_ENTERED",
+          insertDataOption: "INSERT_ROWS",
+          requestBody: { values },
+        }),
+      );
       results.push({ spreadsheetId, range, updatedRange: res.data.updates?.updatedRange ?? range });
     } catch (e: unknown) {
       results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
@@ -808,6 +848,7 @@ async function executeAppendRowsCore(
     reportSubtitle: "запрошено ⇄ живое состояние Google Sheets",
     consentStore,
     auditId,
+    g,
   });
 }
 
@@ -839,7 +880,7 @@ async function executeClearRangeCore(
   for (const { spreadsheetId, range } of payload.items) {
     try {
       const before = preSnapshot.find((s) => s.spreadsheetId === spreadsheetId && s.range === range)?.preValues ?? [];
-      const res = await g.sheets.spreadsheets.values.clear({ spreadsheetId, range });
+      const res = await withRetry(() => g.sheets.spreadsheets.values.clear({ spreadsheetId, range }));
       results.push({ spreadsheetId, range, clearedRange: res.data.clearedRange ?? range, clearedRowCount: before.length });
     } catch (e: unknown) {
       results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
@@ -857,6 +898,7 @@ async function executeClearRangeCore(
     consentStore,
     auditId,
     preSnapshot,
+    g,
   });
 }
 
@@ -883,22 +925,28 @@ async function executeCreateCore(
   auditId: string,
   consentStore: ConsentStore,
 ): Promise<CallToolResult> {
-  const results = await Promise.all(
-    payload.spreadsheets.map(async ({ title, sheetTitles }) => {
-      try {
-        const res = await g.sheets.spreadsheets.create({
+  // Bounded fan-out (mapWithLimit, cap 8) instead of an unbounded Promise.all
+  // — a large batch of spreadsheets used to fire every .create() call at
+  // once, tripping Sheets/Drive per-user rate limits. The 429/5xx retry lives
+  // in `withRetry`, wrapped around just the one network call so a per-item
+  // try/catch below still captures a final failure into `results` instead of
+  // throwing.
+  const results = await mapWithLimit(payload.spreadsheets, async ({ title, sheetTitles }) => {
+    try {
+      const res = await withRetry(() =>
+        g.sheets.spreadsheets.create({
           requestBody: {
             properties: { title },
             sheets: sheetTitles?.length ? sheetTitles.map((t) => ({ properties: { title: t } })) : undefined,
           },
           fields: "spreadsheetId,spreadsheetUrl,properties.title",
-        });
-        return { spreadsheetId: res.data.spreadsheetId ?? "", title: res.data.properties?.title ?? title, spreadsheetUrl: res.data.spreadsheetUrl };
-      } catch (e: unknown) {
-        return { spreadsheetId: "", title, error: String(e instanceof Error ? e.message : e) };
-      }
-    }),
-  );
+        }),
+      );
+      return { spreadsheetId: res.data.spreadsheetId ?? "", title: res.data.properties?.title ?? title, spreadsheetUrl: res.data.spreadsheetUrl };
+    } catch (e: unknown) {
+      return { spreadsheetId: "", title, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
 
   return buildMutationResult({
     results,
@@ -910,6 +958,9 @@ async function executeCreateCore(
     reportSubtitle: "запрошено ⇄ живое состояние Google Drive",
     consentStore,
     auditId,
+    // No `g` here: results already carry the spreadsheet's own `title`
+    // verbatim (it's the create input, echoed back) — re-fetching would just
+    // duplicate it under a second key.
   });
 }
 
@@ -932,10 +983,12 @@ async function executeAddTabCore(
   const results: Array<{ spreadsheetId: string; sheetId?: number; title?: string; error?: string }> = [];
   for (const { spreadsheetId, title } of payload.items) {
     try {
-      const res = await g.sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: { requests: [{ addSheet: { properties: { title } } }] },
-      });
+      const res = await withRetry(() =>
+        g.sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: { requests: [{ addSheet: { properties: { title } } }] },
+        }),
+      );
       const props = res.data.replies?.[0]?.addSheet?.properties;
       results.push({ spreadsheetId, sheetId: props?.sheetId ?? undefined, title: props?.title ?? title });
     } catch (e: unknown) {
@@ -953,6 +1006,7 @@ async function executeAddTabCore(
     reportSubtitle: "запрошено ⇄ живой список вкладок",
     consentStore,
     auditId,
+    g,
   });
 }
 
@@ -979,31 +1033,39 @@ async function executeFindReplaceCore(
   auditId: string,
   consentStore: ConsentStore,
 ): Promise<CallToolResult> {
-  const preMatches = await dryFindMatches(g, {
-    spreadsheetId: payload.spreadsheetId,
-    find: payload.find,
-    matchCase: payload.matchCase,
-    sheetId: payload.sheetId,
-  });
+  // Single call, single spreadsheetId per invocation — "cache" here just
+  // means "call once", fetched alongside preMatches rather than again per
+  // downstream step.
+  const [preMatches, spreadsheetTitle] = await Promise.all([
+    dryFindMatches(g, {
+      spreadsheetId: payload.spreadsheetId,
+      find: payload.find,
+      matchCase: payload.matchCase,
+      sheetId: payload.sheetId,
+    }),
+    liveSpreadsheetTitle(g, payload.spreadsheetId),
+  ]);
   let fr: sheets_v4.Schema$FindReplaceResponse = {};
   let execError: string | undefined;
   try {
-    const res = await g.sheets.spreadsheets.batchUpdate({
-      spreadsheetId: payload.spreadsheetId,
-      requestBody: {
-        requests: [
-          {
-            findReplace: {
-              find: payload.find,
-              replacement: payload.replace,
-              matchCase: payload.matchCase,
-              allSheets: payload.sheetId === undefined ? true : undefined,
-              sheetId: payload.sheetId,
+    const res = await withRetry(() =>
+      g.sheets.spreadsheets.batchUpdate({
+        spreadsheetId: payload.spreadsheetId,
+        requestBody: {
+          requests: [
+            {
+              findReplace: {
+                find: payload.find,
+                replacement: payload.replace,
+                matchCase: payload.matchCase,
+                allSheets: payload.sheetId === undefined ? true : undefined,
+                sheetId: payload.sheetId,
+              },
             },
-          },
-        ],
-      },
-    });
+          ],
+        },
+      }),
+    );
     fr = res.data.replies?.[0]?.findReplace ?? {};
   } catch (e: unknown) {
     execError = String(e instanceof Error ? e.message : e);
@@ -1040,6 +1102,8 @@ async function executeFindReplaceCore(
   }
   return ok({
     summary,
+    spreadsheetId: payload.spreadsheetId,
+    spreadsheetTitle,
     findReplace: fr,
     ...(pv.length ? { verification: renderVerifyReport("Независимая проверка замены", "запрошено ⇄ живое содержимое затронутых ячеек", pv) } : {}),
   });
@@ -1106,10 +1170,12 @@ async function executeFormatRangeCore(
         continue;
       }
 
-      const meta = await g.sheets.spreadsheets.get({
-        spreadsheetId,
-        fields: "sheets.properties(sheetId,title)",
-      });
+      const meta = await withRetry(() =>
+        g.sheets.spreadsheets.get({
+          spreadsheetId,
+          fields: "sheets.properties(sheetId,title)",
+        }),
+      );
       const titleToId = new Map<string, number>();
       for (const s of meta.data.sheets ?? []) {
         if (s.properties?.title && typeof s.properties.sheetId === "number") {
@@ -1119,14 +1185,16 @@ async function executeFormatRangeCore(
       const firstSheetId = meta.data.sheets?.[0]?.properties?.sheetId ?? 0;
       const gridRange = a1ToGridRange(range, titleToId, firstSheetId);
 
-      await g.sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [
-            { repeatCell: { range: gridRange, cell: { userEnteredFormat: fmt }, fields: fields.join(",") } },
-          ],
-        },
-      });
+      await withRetry(() =>
+        g.sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            requests: [
+              { repeatCell: { range: gridRange, cell: { userEnteredFormat: fmt }, fields: fields.join(",") } },
+            ],
+          },
+        }),
+      );
       results.push({ spreadsheetId, range, applied: fields.length });
     } catch (e: unknown) {
       results.push({ spreadsheetId, range, error: String(e instanceof Error ? e.message : e) });
@@ -1150,6 +1218,7 @@ async function executeFormatRangeCore(
     reportSubtitle: "запрошено ⇄ живое форматирование Google Sheets",
     consentStore,
     auditId,
+    g,
   });
 }
 
@@ -1179,15 +1248,22 @@ async function executeRawBatchCore(
   let replies: sheets_v4.Schema$Response[] | undefined;
   let execError: string | undefined;
   try {
-    const res = await g.sheets.spreadsheets.batchUpdate({
-      spreadsheetId: payload.spreadsheetId,
-      requestBody: { requests: payload.requests },
-    });
+    const res = await withRetry(() =>
+      g.sheets.spreadsheets.batchUpdate({
+        spreadsheetId: payload.spreadsheetId,
+        requestBody: { requests: payload.requests },
+      }),
+    );
     replies = res.data.replies ?? undefined;
   } catch (e: unknown) {
     execError = String(e instanceof Error ? e.message : e);
   }
-  const verify = await postVerifyRawBatchApplied(g, payload.spreadsheetId);
+  // Single call, single spreadsheetId per invocation — fetched once here,
+  // alongside the post-verify read, rather than again downstream.
+  const [verify, spreadsheetTitle] = await Promise.all([
+    postVerifyRawBatchApplied(g, payload.spreadsheetId),
+    liveSpreadsheetTitle(g, payload.spreadsheetId),
+  ]);
   const icon = execError ? "❌" : "⚠️"; // always ⚠️ on success — honest limit, see postVerifyRawBatchApplied
   const summary = execError
     ? `❌ Raw batchUpdate failed: ${execError}`
@@ -1204,6 +1280,7 @@ async function executeRawBatchCore(
   return ok({
     summary,
     spreadsheetId: payload.spreadsheetId,
+    spreadsheetTitle,
     replies,
     verification: renderVerifyReport("Независимая проверка raw batchUpdate", "запрошено ⇄ доступность таблицы (содержимое не проверяется — честный предел)", [verify]),
   });
