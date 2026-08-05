@@ -67,20 +67,16 @@ export const consentServerConfig: ConsentConfig = {
  * rather than silently degrading. Exported so http.ts can mount `/tg/webhook`
  * and call `registerWebhook()` at startup without re-deriving it.
  *
- * KNOWN GAP (not this file's fault — flagged, not worked around): unlike
- * gmail-mcp, THIS server's `consent.ts` does not yet declare a `tg?:
- * TgApprovalGate` field on `RequireConsentParams`, nor an `if (p.tg?.
- * enabledFor(tool))` branch inside `requireConsent()` — the two repos have
- * drifted. That means `tgApprovalGate` below is built and fully functional
- * (webhook, storage, Telegram HTTP calls all work end-to-end and are
- * covered by scripts/test-tg-approval.mjs), but it is NOT YET threaded into
- * `SheetsConsentContext` or any `requireConsent(...)` call in tools/sheets.ts
- * / tools/triage.ts — doing so today would not compile (`tg` is not a known
- * property of `RequireConsentParams`) and, more importantly, would be a
- * no-op even if it did, since requireConsent() itself never reads `p.tg`.
- * Wiring that in requires porting consent.ts's `tg` support from gmail-mcp
- * FIRST (out of scope for this port — see mcp-development-standard's
- * "обсуждение до кода" rule for any change to consent.ts itself).
+ * PREVIOUSLY A KNOWN GAP, fixed 2026-08-05 (auto-execute port): `consent.ts`
+ * now carries the `tg?: TgApprovalGate` field on `RequireConsentParams` and
+ * the `if (p.tg?.enabledFor(tool))` branches inside `requireConsent()` (was
+ * drifted from gmail-mcp before, is not any more), AND `tools/sheets.ts` /
+ * `tools/triage.ts` already destructure `tg` from `SheetsConsentContext` and
+ * pass it into every `requireConsent(...)` call. The one piece that was
+ * still missing — `buildMcpServer()`'s `consentCtx` object below never set
+ * `tg`, so `ctx.tg` was `undefined` at every call site and the whole
+ * Telegram-button layer was silently inert even though every other part of
+ * it worked — is fixed by the `tg: tgApprovalGate` field a few lines down.
  */
 export const tgApprovalConfig = loadTgApprovalConfig(consentGateEnv.server);
 
@@ -118,6 +114,7 @@ export function buildMcpServer(user: User): McpServer {
     consentStore: storeReady() ? consentStoreAdapter : null,
     consentCfg: consentServerConfig,
     auditStore: storeReady() ? auditStoreAdapter : null,
+    tg: tgApprovalGate,
   };
   registerAccountTools(server, clients);
   registerSheetsTools(server, clients, consentCtx);
