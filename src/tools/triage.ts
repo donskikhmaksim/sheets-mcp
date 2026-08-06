@@ -5,8 +5,24 @@
  *   A: ID  B: Date  C: Account  D: From  E: Subject
  *   F: Claude Suggested  G: Maksim Said  H: Why Not Closed  I: Status
  *
- * The spreadsheetId is a constant — these tools physically cannot write to any
- * other spreadsheet, making them safe to mark as always_allow.
+ * ⚠️ ИСПРАВЛЕНО 2026-08-06. Здесь стояло: «spreadsheetId — константа, эти
+ * инструменты физически не могут писать в другую таблицу, поэтому их
+ * БЕЗОПАСНО пометить always_allow». Фактическая часть верна (SPREADSHEET_ID
+ * ниже — константа, все три вызова Sheets API идут только в неё), но ВЫВОД
+ * был неверный, и приглашал снять подтверждение с двух ПИШУЩИХ методов:
+ *
+ *  • это утверждение про РАДИУС ПОРАЖЕНИЯ («не в ту таблицу не попадём»), а не
+ *    про СОДЕРЖИМОЕ: что именно окажется в колонках «Claude Suggested» /
+ *    «Maksim Said», константа не ограничивает никак;
+ *  • `triage_log_update` не дописывает, а ПЕРЕЗАПИСЫВАЕТ ячейки G/H/I уже
+ *    существующей строки — то есть может затереть ранее записанные слова
+ *    владельца. Отката в листе нет;
+ *  • стандарт Максима (mcp-development-standard §1, инвариант 2) не знает
+ *    исключений «по мелкости/обратимости»: гейт у ВСЕХ write.
+ *
+ * Поэтому оба метода гейтованы через `requireConsent`, оба перечислены в
+ * GATED_TOOLS проверки полноты, и `UNGATED_WRITE_ALLOWLIST` в ней пуст.
+ * always_allow здесь неуместен — не ставить.
  */
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -255,13 +271,9 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
   const ACCOUNT = userClients.defaultName;
 
   // ── triage_log_add ─────────────────────────────────────────────────────────
-  // DEBATABLE (flagged per Maksim's "gate ALL write tools, no exceptions"
-  // decision — see the port report): this file's own header comment argues
-  // triage_log_add/update are safe to always_allow because the spreadsheetId
-  // is a hardcoded constant (can't write anywhere else). That argument is
-  // about BLAST RADIUS (can't hit the wrong spreadsheet), not about content —
-  // a wrong `claudeSuggested`/`maksimSaid` value can still be logged
-  // incorrectly. Gated anyway per the standing rule.
+  // Гейтован, как и `triage_log_update`. Разбор старого аргумента «константный
+  // spreadsheetId ⇒ можно always_allow» — в шапке файла: он про радиус
+  // поражения, а не про содержимое записи.
   // `AddRow`/`AddPayload` now live at module level (see above `registerTriageTools`).
 
   server.registerTool(
@@ -426,7 +438,8 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       title: "Get pending triage entries",
       description:
         "Return all rows from the Triage Log where Status = pending. " +
-        "Call at the start of each email session to surface unresolved threads. always_allow.",
+        "Call at the start of each email session to surface unresolved threads. " +
+        "Read-only: never writes to the sheet.",
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },

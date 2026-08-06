@@ -22,6 +22,12 @@
  * without going through requireConsent breaks CI instead of shipping
  * silently ungated.
  *
+ * ⚠️ И ЭТО СТАЛО ПРАВДОЙ ТОЛЬКО 2026-08-06. До того фраза выше про «breaks
+ * CI» была ложью, которая усыпляла: `npm test` в GitHub Actions не запускался
+ * ВООБЩЕ (в .github/workflows лежали только guide.yml и sync-upstream.yml),
+ * так что эта проверка могла падать разве что на чьём-то ноутбуке. Теперь её
+ * гоняет `.github/workflows/test.yml` на push в main и на каждый PR.
+ *
  * Usage: node scripts/test-gate-coverage.mjs
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

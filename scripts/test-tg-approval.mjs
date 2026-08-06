@@ -6,20 +6,19 @@
  * MockAgent (тот же HTTP-клиент, что использует сам модуль в проде), store —
  * in-memory Map с тем же атомарным контрактом, что store.ts's tg_approvals.
  *
- * ОТЛИЧИЕ ОТ gmail-mcp/scripts/test-tg-approval.mjs (задокументированный
- * пробел, не забытая работа): в gmail-mcp `src/consent.ts` уже несёт
- * `tg?: TgApprovalGate` на `RequireConsentParams` и ветку
- * `if (p.tg?.enabledFor(tool))` внутри `requireConsent()`, поэтому тот файл
- * гоняет сценарии ЧЕРЕЗ `requireConsent({ ..., tg: gate })`. В sheets-mcp
- * `src/consent.ts` этой поддержки НЕТ (расхождение между репо — см.
- * `src/server.ts`'s "KNOWN GAP" комментарий у `tgApprovalGate`), и трогать
- * consent.ts здесь не разрешено (mcp-development-standard: любая архитектурная
- * правка гейта требует отдельного обсуждения/одобрения). Поэтому этот файл
- * тестирует `tg_approval.ts` НАПРЯМУЮ, через его собственные экспорты
- * (`createTgApprovalGate`, `handleWebhook`, `registerWebhook`,
- * `secretTokenMatches`) — модуль полностью функционален и покрыт, только не
- * через requireConsent(). Как только consent.ts получит `tg`-ветку, эти же
- * сценарии стоит обернуть в requireConsent(), как в gmail-mcp.
+ * ⚠️ ИСПРАВЛЕНО 2026-08-06. Здесь стояло, что «в sheets-mcp `src/consent.ts`
+ * поддержки `tg` НЕТ» и потому файл тестирует `tg_approval.ts` напрямую. Это
+ * давно неправда: `RequireConsentParams` несёт `tg?: TgApprovalGate`, внутри
+ * `requireConsent()` есть и ветка `if (p.tg?.enabledFor(tool))`, и режим
+ * button-only, а `server.ts` реально прокидывает гейт в каждый гейтованный
+ * тул. Комментарий пережил свою причину.
+ *
+ * Разделение обязанностей теперь такое: ЭТОТ файл покрывает сам
+ * `tg_approval.ts` через его собственные экспорты (`createTgApprovalGate`,
+ * `handleWebhook`, `registerWebhook`, `secretTokenMatches`) — HTTP, вебхук,
+ * анти-replay, TTL. Сценарии ЧЕРЕЗ `requireConsent({ ..., tg: gate })` живут
+ * в `scripts/test-consent.mjs`, разделы [21]-[30] (button-only, метка
+ * `tg_notified`, судьба плана при approved/rejected/none).
  *
  * Запуск (Node ≥ 22.6 грузит .ts напрямую, tsx/build не нужны):
  *   node scripts/test-tg-approval.mjs

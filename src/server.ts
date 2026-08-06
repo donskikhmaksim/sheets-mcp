@@ -69,7 +69,7 @@ export const consentServerConfig: ConsentConfig = {
  * rather than silently degrading. Exported so http.ts can mount `/tg/webhook`
  * and call `registerWebhook()` at startup without re-deriving it.
  *
- * PREVIOUSLY A KNOWN GAP, fixed 2026-08-05 (auto-execute port): `consent.ts`
+ * БЫЛО ПРОБЕЛОМ, закрыто 2026-08-05 (auto-execute port): `consent.ts`
  * now carries the `tg?: TgApprovalGate` field on `RequireConsentParams` and
  * the `if (p.tg?.enabledFor(tool))` branches inside `requireConsent()` (was
  * drifted from gmail-mcp before, is not any more), AND `tools/sheets.ts` /
@@ -94,8 +94,14 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
 
 /** Always constructed (even when TG_APPROVAL_ENABLED=false) so `enabledFor()`
  * is simply false for every tool in that case — the compatibility invariant
- * a fork without a configured Telegram bot relies on. See the KNOWN GAP note
- * above: this object is not yet reachable from any gated tool in THIS repo. */
+ * a fork without a configured Telegram bot relies on.
+ *
+ * ⚠️ ИСПРАВЛЕНО 2026-08-06: здесь стояло «this object is not yet reachable
+ * from any gated tool in THIS repo». Это неправда с момента, когда
+ * `buildMcpServer()` ниже начал класть `tg: tgApprovalGate` в `consentCtx` —
+ * гейт достижим из КАЖДОГО гейтованного тула, и с ним же работает
+ * button-only-режим (`consent.ts`'s `tgButtonOnly`). Комментарий пережил свою
+ * причину и вводил в заблуждение. */
 export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter);
 
 export function buildMcpServer(user: User): McpServer {
