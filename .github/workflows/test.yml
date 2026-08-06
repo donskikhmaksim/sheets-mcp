@@ -1,0 +1,29 @@
+name: Typecheck and tests
+
+# Проверка полноты гейта (scripts/test-gate-coverage.mjs) — это то, что не даёт
+# новому write-инструменту уехать в прод без подтверждения. Но до этого
+# workflow её в CI не гонял НИКТО: в репозитории лежали только guide.yml и
+# sync-upstream.yml, а `npm test` не запускался вообще. Проверка при этом сама
+# про себя писала, что «ломает сборку» — и это было неправдой, которая
+# усыпляла. Теперь запускается здесь, на push в main и на каждый PR.
+#
+# Всё офлайн: ни сети сверх loopback, ни секретов, ни базы — Google/Telegram
+# клиенты и fetch замоканы, Postgres заменён фейковым in-memory store.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

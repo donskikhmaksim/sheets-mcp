@@ -22,6 +22,12 @@
  * without going through requireConsent breaks CI instead of shipping
  * silently ungated.
  *
+ * ⚠️ И ЭТО СТАЛО ПРАВДОЙ ТОЛЬКО 2026-08-06. До того фраза выше про «breaks
+ * CI» была ложью, которая усыпляла: `npm test` в GitHub Actions не запускался
+ * ВООБЩЕ (в .github/workflows лежали только guide.yml и sync-upstream.yml),
+ * так что эта проверка могла падать разве что на чьём-то ноутбуке. Теперь её
+ * гоняет `.github/workflows/test.yml` на push в main и на каждый PR.
+ *
  * Usage: node scripts/test-gate-coverage.mjs
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -115,6 +121,10 @@ function makeConsentStore() {
     },
     async consumeManifest() {
       return null; // this test never confirms — only the plan phase is exercised
+    },
+    async markTgNotified(id, server) {
+      const r = manifests.get(id);
+      if (r && r.server === server) r.tgNotified = true;
     },
     async invalidateManifest() {},
     async appendConsentAudit() {},
@@ -255,6 +265,65 @@ console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exha
 for (const name of ["sheets_list", "sheets_get_info", "sheets_read_range", "sheets_find", "sheets_get_formatting", "sheets_consent_audit", "triage_log_get_pending", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
+}
+
+// ═══ [6] ИНВЕНТАРИЗАЦИЯ button-only ════════════════════════════════════════
+//
+// Правило: у КАЖДОГО тула, чей план уходит в Telegram кнопкой, обязан быть
+// способ исполнения ПО НАЖАТИЮ (запись в реестре `autoExecute.ts`) — иначе
+// человек нажмёт кнопку, а не произойдёт ничего, и текстовый путь тоже
+// закрыт... точнее, НЕ закрыт: consent.ts's `tgButtonOnly` требует ОБА
+// условия, поэтому отсутствие исполнителя даёт мягкую деградацию (остаётся
+// обычный текстовый путь), а не мёртвый тул. Этот раздел следит, чтобы такая
+// деградация не стала нормой незаметно.
+//
+// Список тулов берётся из ОПУБЛИКОВАННОГО реестра (`client.listTools()` выше),
+// а признак «проходит гейт» — наличие в опубликованной схеме ОБОИХ параметров
+// подтверждения. Regex-скан исходника для этого не годится: он показывает,
+// что написано в файле, а не что сервер реально отдаёт модели.
+console.log("\n[6] у каждого гейтованного write-тула есть авто-исполнитель (button-only инвентаризация)");
+{
+  const { registeredAutoExecuteTools } = await import("../dist/autoExecute.js");
+  const registered = new Set(registeredAutoExecuteTools());
+
+  // Поимённые исключения. Пусто: любой тул без исполнителя обязан быть
+  // объяснён ЗДЕСЬ, а не молча выпасть из отчёта.
+  const NO_AUTO_EXECUTOR_ALLOWLIST = {};
+
+  const gatedByPublishedSchema = writes.filter((t) => {
+    const props = t.inputSchema?.properties ?? {};
+    return "manifest_id" in props && "user_reply" in props;
+  });
+
+  // Нижняя граница: сломанный отбор не должен «пройти» по пустому множеству.
+  check(
+    "гейтованных write-тулов найдено ≥ 10 (отбор не выродился в пустое множество)",
+    gatedByPublishedSchema.length >= 10,
+    String(gatedByPublishedSchema.length),
+  );
+  check(
+    "каждый write-тул проходит гейт (гейтованных = всех write)",
+    gatedByPublishedSchema.length === writes.length,
+    `gated=${gatedByPublishedSchema.length} writes=${writes.length}`,
+  );
+  check("реестр авто-исполнителей непуст (нижняя граница)", registered.size >= 10, String(registered.size));
+
+  for (const t of gatedByPublishedSchema) {
+    const has = registered.has(t.name);
+    const excused = t.name in NO_AUTO_EXECUTOR_ALLOWLIST;
+    check(
+      `${t.name} — есть исполнитель по кнопке (или поимённое исключение)`,
+      has || excused,
+      has ? "" : "нет записи в autoExecute-реестре и нет объяснения в allowlist",
+    );
+  }
+
+  // И обратная сверка: в реестре нет исполнителей для того, чего сервер не
+  // публикует (мёртвая запись = забытый переименованный тул).
+  const published = new Set(tools.map((t) => t.name));
+  for (const name of registered) {
+    check(`реестр: «${name}» соответствует реально опубликованному тулу`, published.has(name), "тул не найден в listTools()");
+  }
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

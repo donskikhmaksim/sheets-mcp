@@ -115,6 +115,10 @@ async function harness(world) {
       r.userReply = userReply;
       return { ...r };
     },
+    async markTgNotified(id, server) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") r.tgNotified = true;
+    },
     async invalidateManifest(id, server, userReply) {
       const r = manifests.get(id);
       if (r && r.server === server && r.status === "AWAITING_CONSENT") {
@@ -334,6 +338,10 @@ async function triageHarness(world) {
       r.status = "DONE";
       r.userReply = userReply;
       return { ...r };
+    },
+    async markTgNotified(id, server) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") r.tgNotified = true;
     },
     async invalidateManifest(id, server, userReply) {
       const r = manifests.get(id);
