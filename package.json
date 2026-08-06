@@ -11,8 +11,8 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:consent": "node scripts/test-consent.mjs",
-    "test": "tsx --test src/**/*.test.ts && npm run build && node scripts/test-consent.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-sheets-gate.mjs && node scripts/test-tg-approval.mjs && node scripts/test-tg-webhook-gate.mjs && node scripts/test-auto-execute.mjs"
+    "test:consent": "tsx scripts/test-consent.mjs",
+    "test": "tsx --test src/**/*.test.ts && npm run build && tsx scripts/test-consent.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-sheets-gate.mjs && tsx scripts/test-tg-approval.mjs && node scripts/test-tg-webhook-gate.mjs && tsx scripts/test-auto-execute.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

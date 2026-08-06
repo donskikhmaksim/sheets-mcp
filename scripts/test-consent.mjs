@@ -22,7 +22,10 @@ import {
   classifyReply,
   canonicalJson,
   sha256,
+  tgButtonOnly,
+  tryAutoExecute,
 } from "../src/consent.ts";
+import { registerAutoExecutor, getAutoExecutor } from "../src/autoExecute.ts";
 
 // ── фейковое хранилище + управляемые часы ───────────────────────────────────
 
@@ -57,6 +60,10 @@ function makeStore() {
       r.consumedAt = clock.t;
       r.userReply = userReply;
       return { ...r };
+    },
+    async markTgNotified(id, server) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") r.tgNotified = true;
     },
     async invalidateManifest(id, server, userReply) {
       const r = manifests.get(id);
@@ -148,11 +155,11 @@ console.log("\n[2] половина пары (только manifest_id или т
 {
   const store = makeStore();
   const d1 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: "x", plan, rehash, store, cfg });
-  check("только id → refused", d1.kind === "refused" && d1.result.includes("Нужны оба"), d1.result?.slice(0, 60));
+  check("только id → refused", d1.kind === "refused" && d1.result?.includes("Нужны оба"), d1.result?.slice(0, 60));
   const d2 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", userReply: "да", plan, rehash, store, cfg });
-  check("только reply → refused", d2.kind === "refused" && d2.result.includes("Нужны оба"));
+  check("только reply → refused", d2.kind === "refused" && d2.result?.includes("Нужны оба"));
   check("манифест НЕ создан", store.manifests.size === 0);
-  check("🛑 в заголовке отказа", d1.result.includes("🛑"));
+  check("🛑 в заголовке отказа", d1.result?.includes("🛑"));
 }
 
 // ── 3. батч > капа → 🛑 без манифеста ───────────────────────────────────────
@@ -162,7 +169,7 @@ console.log("\n[3] батч больше SEND_BATCH_MAX → 🛑, манифес
   const bigPlan = () => ({ payload: PAYLOAD, objectHash: OBJHASH, preview: "p", batchSize: 11 });
   const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan: bigPlan, rehash, store, cfg });
   check("kind=refused", dec.kind === "refused");
-  check("сообщение про разбивку", dec.result.includes("Разбей") || dec.result.includes("больше предела"), dec.result?.slice(0, 80));
+  check("сообщение про разбивку", dec.result?.includes("Разбей") || dec.result?.includes("больше предела"), dec.result?.slice(0, 80));
   check("манифест НЕ создан", store.manifests.size === 0);
 }
 
@@ -192,7 +199,7 @@ console.log("\n[5] план+execute в одном ходе (gap<5с) → 🛑, �
   // никакой паузы: то же значение часов
   const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash, store, cfg });
   check("kind=refused", dec.kind === "refused");
-  check("сообщение про «слишком быстро»", dec.result.includes("Слишком быстро"), dec.result?.slice(0, 60));
+  check("сообщение про «слишком быстро»", dec.result?.includes("Слишком быстро"), dec.result?.slice(0, 60));
   check("манифест НЕ consumed, всё ещё AWAITING", store.manifests.get(id).status === "AWAITING_CONSENT");
 }
 
@@ -205,7 +212,7 @@ for (const svc of ['SEND 1', '{"ok":true}', '550e8400-e29b-41d4-a716-44665544000
   clock.t += 6_000;
   const reply = svc === "MANIFEST_ID_SELF" ? id : svc === "TOOL_SELF" ? "sheets_write_range" : svc;
   const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: reply, plan, rehash, store, cfg });
-  check(`«${svc}» → refused (не ответ человека)`, dec.kind === "refused" && dec.result.includes("не ответ человека"), dec.result?.slice(0, 50));
+  check(`«${svc}» → refused (не ответ человека)`, dec.kind === "refused" && dec.result?.includes("не ответ человека"), dec.result?.slice(0, 50));
   check(`«${svc}» — манифест жив`, store.manifests.get(id).status === "AWAITING_CONSENT");
 }
 
@@ -219,7 +226,7 @@ console.log("\n[7] отрицание инвалидирует манифест;
   const id = planned.manifestId;
   clock.t += 6_000;
   const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "нет, не отправляй", plan, rehash, store, cfg });
-  check("kind=refused (отменено)", dec.kind === "refused" && dec.result.includes("Отменено"));
+  check("kind=refused (отменено)", dec.kind === "refused" && dec.result?.includes("Отменено"));
   check("манифест INVALIDATED", store.manifests.get(id).status === "INVALIDATED");
   check("аудит помечен invalidated", store.audits.at(-1).outcome === "invalidated");
   // повторное исполнение инвалидированного → отказ
@@ -238,14 +245,14 @@ console.log("\n[8] ни да ни нет → 🛑, манифест жив");
   // «наверное …» — это класс `hedge` (неуверенность), а не «не понял»: план
   // тоже остаётся жив, но отказ честно называет причину.
   const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "наверное как-нибудь потом", plan, rehash, store, cfg });
-  check("kind=refused (неуверенность)", dec.kind === "refused" && dec.result.includes("Неуверенный"), dec.result?.slice(0, 50));
+  check("kind=refused (неуверенность)", dec.kind === "refused" && dec.result?.includes("Неуверенный"), dec.result?.slice(0, 50));
   check("манифест жив", store.manifests.get(id).status === "AWAITING_CONSENT");
   // а «ни да ни нет» без признаков неуверенности → ambiguous.
   clock.t = 1_700_000_000_000;
   const p2 = await buildPlan();
   clock.t += 6_000;
   const dec2 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: p2.dec.manifestId, userReply: "что там по срокам", plan, rehash, store: p2.store, cfg });
-  check("ambiguous → refused («не однозначное»)", dec2.kind === "refused" && dec2.result.includes("не однозначное"), dec2.result?.slice(0, 60));
+  check("ambiguous → refused («не однозначное»)", dec2.kind === "refused" && dec2.result?.includes("не однозначное"), dec2.result?.slice(0, 60));
   check("ambiguous — манифест жив", p2.store.manifests.get(p2.dec.manifestId).status === "AWAITING_CONSENT");
 }
 
@@ -258,7 +265,7 @@ console.log("\n[9] binding: rehash не совпал → 🛑, манифест 
   clock.t += 6_000;
   const changedRehash = () => sha256({ changed: true }); // «получатель уехал»
   const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash: changedRehash, store, cfg });
-  check("kind=refused (состояние изменилось)", dec.kind === "refused" && dec.result.includes("изменилось"));
+  check("kind=refused (состояние изменилось)", dec.kind === "refused" && dec.result?.includes("изменилось"));
   check("манифест НЕ consumed", store.manifests.get(id).status === "AWAITING_CONSENT");
 }
 
@@ -296,7 +303,7 @@ console.log("\n[12] чужой tool/account к манифесту → 🛑");
   const id = planned.manifestId;
   clock.t += 6_000;
   const dWrongTool = await requireConsent({ tool: "sheets_clear_range", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash, store, cfg });
-  check("другой tool → refused", dWrongTool.kind === "refused" && dWrongTool.result.includes("не найден"));
+  check("другой tool → refused", dWrongTool.kind === "refused" && dWrongTool.result?.includes("не найден"));
   const dWrongAcct = await requireConsent({ tool: "sheets_write_range", accountLabel: "personal", manifestId: id, userReply: "да", plan, rehash, store, cfg });
   check("другой account → refused", dWrongAcct.kind === "refused");
   check("манифест не тронут", store.manifests.get(id).status === "AWAITING_CONSENT");
@@ -508,7 +515,7 @@ console.log("\n[19] наборы caveat / позднее отрицание / п
   // и хотя бы одна реально сжигает план в полном гейте
   const rc = await runReply("ок, кроме последней");
   check("caveat в гейте: refused + INVALIDATED", rc.dec.kind === "refused" && rc.status === "INVALIDATED", `${rc.dec.kind}/${rc.status}`);
-  check("caveat: отказ объясняет «частичное»", rc.dec.result.includes("Частичное"), rc.dec.result?.slice(0, 60));
+  check("caveat: отказ объясняет «частичное»", rc.dec.result?.includes("Частичное"), rc.dec.result?.slice(0, 60));
 
   // Позднее отрицание: утверждение в начале не отменяет отказ в конце.
   const LATE = [
@@ -533,7 +540,7 @@ console.log("\n[19] наборы caveat / позднее отрицание / п
   for (const s of PARAS) check(`paraphrase: «${s}»`, classifyReply(s, CTX) === "paraphrase", classifyReply(s, CTX));
   const rp = await runReply("Пользователь: да");
   check("paraphrase в гейте: refused, план ЖИВ", rp.dec.kind === "refused" && rp.status === "AWAITING_CONSENT", `${rp.dec.kind}/${rp.status}`);
-  check("paraphrase: отказ просит дословную реплику", rp.dec.result.includes("пересказ"), rp.dec.result?.slice(0, 60));
+  check("paraphrase: отказ просит дословную реплику", rp.dec.result?.includes("пересказ"), rp.dec.result?.slice(0, 60));
 
   // Эхо служебного жаргона ЭТОГО сервера.
   const ECHOES = [
@@ -613,6 +620,229 @@ console.log("\n[20] кириллические маркеры (ловушка \\
   // иначе обычное «да, только быстрее» перестало бы работать.
   check("«да, только быстрее» = affirmation (наречие гасит caveat)", classifyReply("да, только быстрее", CTX) === "affirmation", classifyReply("да, только быстрее", CTX));
   check("«ок, только первые две» = caveat", classifyReply("ок, только первые две", CTX) === "caveat", classifyReply("ок, только первые две", CTX));
+}
+
+// ═══ ИСПОЛНЕНИЕ ТОЛЬКО КНОПКОЙ (порт из ticktick-mcp PR #17) ════════════════
+//
+// Если Telegram-слой включён И план РЕАЛЬНО ушёл кнопкой — текстовое
+// подтверждение для этого плана закрывается СОВСЕМ: модель физически не может
+// исполнить операцию, только человек нажатием. Это устраняет дыру «модель
+// сочиняет согласие за человека», а не уменьшает её.
+
+// Фейковый авто-исполнитель — ровно то «есть чем исполнить по нажатию», по
+// которому tgButtonOnly() принимает решение. Регистрируется здесь, а не в
+// шапке файла, чтобы разделы 0-20 гонялись в исходных условиях.
+let autoExecuted = 0;
+registerAutoExecutor("sheets_write_range", {
+  rehash: (addressing) => sha256(addressing),
+  execute: async () => {
+    autoExecuted++;
+    return "✅ записано (фон)";
+  },
+});
+// «sheets_clear_range» СОЗНАТЕЛЬНО не регистрируется — на нём проверяется
+// мягкая деградация (нет исполнителя ⇒ текстовый путь остаётся открыт).
+
+/** Фейковый TgApprovalGate со счётчиками вызовов. */
+function makeTgGate({ approval = "pending", enabled = true, sendOk = true } = {}) {
+  const calls = { notify: 0, check: 0, enabledFor: 0 };
+  return {
+    calls,
+    setApproval(v) { approval = v; },
+    enabledFor() { calls.enabledFor++; return enabled; },
+    async notifyPlan() { calls.notify++; return sendOk ? { ok: true } : { ok: false, error: "boom" }; },
+    async checkApproval() { calls.check++; return approval; },
+  };
+}
+
+/** План, ушедший кнопкой: строится с tg-гейтом, поэтому получает метку. */
+async function buildButtonPlan(tool = "sheets_write_range", gate = makeTgGate()) {
+  clock.t = 1_700_000_000_000;
+  const store = makeStore();
+  const dec = await requireConsent({ tool, accountLabel: "work", plan, rehash, store, cfg, tg: gate });
+  clock.t += 6_000;
+  return { store, gate, id: dec.manifestId, planned: dec };
+}
+
+// ── 21. формула tgButtonOnly: две строки, никаких списков имён ──────────────
+console.log("\n[21] формула button-only: метка плана × наличие авто-исполнителя");
+{
+  check("нет метки, есть исполнитель → false", tgButtonOnly({ tool: "sheets_write_range", tgNotified: false }) === false);
+  check("метка undefined → false", tgButtonOnly({ tool: "sheets_write_range" }) === false);
+  check("метка есть, исполнителя НЕТ → false (мягкая деградация)", tgButtonOnly({ tool: "sheets_clear_range", tgNotified: true }) === false);
+  check("метка есть + исполнитель есть → true", tgButtonOnly({ tool: "sheets_write_range", tgNotified: true }) === true);
+}
+
+// ── 22. метка ставится ровно при успешной отправке кнопок ───────────────────
+console.log("\n[22] tg_notified ставится только после успешного notifyPlan");
+{
+  const { store, id } = await buildButtonPlan();
+  check("после успешной отправки метка стоит", store.manifests.get(id).tgNotified === true);
+
+  // Без Telegram-слоя метка не появляется НИКОГДА — это и есть инвариант
+  // совместимости для форка без бота.
+  const p = await buildPlan();
+  check("без tg-гейта метки нет", !p.store.manifests.get(p.dec.manifestId).tgNotified);
+
+  // Отправка провалилась → fail-closed: план убит, метки нет.
+  clock.t = 1_700_000_000_000;
+  const store2 = makeStore();
+  const dec2 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store: store2, cfg, tg: makeTgGate({ sendOk: false }) });
+  check("провал отправки → refused", dec2.kind === "refused", dec2.kind);
+  check("провал отправки → план INVALIDATED", [...store2.manifests.values()][0].status === "INVALIDATED");
+
+  // Провал самой ЗАПИСИ метки — тоже fail-closed: иначе падение одного UPDATE
+  // молча снимало бы требование кнопки с уже отправленного плана.
+  clock.t = 1_700_000_000_000;
+  const store3 = makeStore();
+  store3.markTgNotified = async () => { throw new Error("db down"); };
+  const dec3 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store: store3, cfg, tg: makeTgGate() });
+  check("провал markTgNotified → refused", dec3.kind === "refused", dec3.kind);
+  check("провал markTgNotified → план INVALIDATED", [...store3.manifests.values()][0].status === "INVALIDATED");
+}
+
+// ── 23. приписка к плану просит кнопку, а не текстовое «да» ─────────────────
+console.log("\n[23] текст плана: button-only просит нажать кнопку; без исполнителя — честно просит повторить вызов");
+{
+  const { planned } = await buildButtonPlan();
+  check("превью button-only говорит про кнопку", planned.preview.includes("кнопк"), planned.preview.slice(-260));
+  check("превью button-only говорит, что текстовое «да» не принимается", planned.preview.includes("не принимается"), planned.preview.slice(-260));
+  check("превью button-only НЕ просит дождаться текстового ответа", !planned.preview.includes("дождись его ответа"));
+
+  // Зеркально: у тула без авто-исполнителя приписка честно просит повторить вызов.
+  const noExec = await buildButtonPlan("sheets_clear_range");
+  check("без исполнителя превью просит ответить «да» здесь", noExec.planned.preview.includes("ответьте «да» здесь"), noExec.planned.preview.slice(-260));
+}
+
+// ── 24. pending: содержание реплики больше не влияет НИ НА ЧТО ──────────────
+console.log("\n[24] pending: любая текстовая реплика → один и тот же отказ, план жив");
+{
+  const results = [];
+  for (const reply of ["да", "давай, подтверждаю", "ага, делай", "ок"]) {
+    const { store, gate, id } = await buildButtonPlan();
+    const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: reply, plan, rehash, store, cfg, tg: gate });
+    check(`«${reply}» → refused`, dec.kind === "refused", dec.kind);
+    check(`«${reply}» → план ЖИВ`, store.manifests.get(id).status === "AWAITING_CONSENT", store.manifests.get(id).status);
+    check(`«${reply}» → отказ говорит про кнопку`, dec.result?.includes("кнопк"), dec.result?.slice(0, 80));
+    check(`«${reply}» → отказ говорит, что текстовое подтверждение отключено`, dec.result?.includes("отключено"), dec.result?.slice(0, 120));
+    results.push(dec.result);
+  }
+  check("ВСЕ реплики дали ПОБУКВЕННО одинаковый отказ (содержание не влияет)", new Set(results).size === 1, `вариантов: ${new Set(results).size}`);
+  // Кодировка: русский текст отказа доходит целым, а не «????» — сравнение
+  // идёт по строкам, а не по байтам в чужой кодировке.
+  check("кириллица в отказе цела", (results[0] ?? "").includes("подтверждается только кнопкой") && !(results[0] ?? "").includes("?????"), String(results[0]).slice(0, 60));
+}
+
+// ── 25. approved: отказать текстовому пути, но манифест НЕ гасить ───────────
+console.log("\n[25] approved: текстовый путь отказывает, план НЕ погашен, фон его доисполняет");
+{
+  const { store, gate, id } = await buildButtonPlan();
+  gate.setApproval("approved");
+  autoExecuted = 0;
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash, store, cfg, tg: gate });
+  check("approved → refused (ничего не повторяем)", dec.kind === "refused", dec.kind);
+  check("approved → отказ объясняет «уже подтверждено кнопкой»", dec.result?.includes("Уже подтверждено кнопкой"), dec.result?.slice(0, 80));
+  // КРИТИЧНО: если погасить манифест здесь, фоновый исполнитель найдёт его
+  // закрытым и операция не произойдёт ВООБЩЕ.
+  check("approved → манифест НЕ погашен", store.manifests.get(id).status === "AWAITING_CONSENT", store.manifests.get(id).status);
+
+  // Обратная сторона: фоновый исполнитель после этого реально доисполняет.
+  const auto = await tryAutoExecute({ manifestId: id, tool: "sheets_write_range", accountLabel: "work" }, rehash, store, cfg);
+  check("фон нашёл план и исполнил (операция не потеряна)", auto !== null && auto.manifestId === id, String(auto));
+  check("фон пометил манифест DONE", store.manifests.get(id).status === "DONE");
+  const exec = getAutoExecutor("sheets_write_range");
+  await exec.execute(auto.payload, auto.auditId, {});
+  check("исполнитель реально отработал", autoExecuted === 1, String(autoExecuted));
+
+  // Идемпотентность: повторный текстовый вызов уже исполненного плана.
+  clock.t += 1_000;
+  const again = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash, store, cfg, tg: gate });
+  check("повтор после исполнения → refused (не исполняется дважды)", again.kind === "refused", again.kind);
+  check("повтор объясняет, что плана уже нет", again.result?.includes("не найден"), again.result?.slice(0, 80));
+  check("исполнитель повторно НЕ вызывался", autoExecuted === 1, String(autoExecuted));
+}
+
+// ── 26. rejected → план сожжён; none → построй заново ───────────────────────
+console.log("\n[26] rejected сжигает план; none просит перепланировать");
+{
+  const r = await buildButtonPlan();
+  r.gate.setApproval("rejected");
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: r.id, userReply: "да", plan, rehash, store: r.store, cfg, tg: r.gate });
+  check("rejected → refused", dec.kind === "refused");
+  check("rejected → план СОЖЖЁН", r.store.manifests.get(r.id).status === "INVALIDATED", r.store.manifests.get(r.id).status);
+
+  const n = await buildButtonPlan();
+  n.gate.setApproval("none");
+  const dec2 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: n.id, userReply: "да", plan, rehash, store: n.store, cfg, tg: n.gate });
+  check("none → refused («истёк»)", dec2.kind === "refused" && dec2.result?.includes("истёк"), dec2.result?.slice(0, 80));
+  check("none → план жив (перепланировать)", n.store.manifests.get(n.id).status === "AWAITING_CONSENT");
+}
+
+// ── 27. отрицание СИЛЬНЕЕ button-only (порядок проверок) ────────────────────
+console.log("\n[27] «нет»/оговорка на button-only плане: план сжигается, кнопка уже ни при чём");
+{
+  const r = await buildButtonPlan();
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: r.id, userReply: "нет, отмена", plan, rehash, store: r.store, cfg, tg: r.gate });
+  check("«нет, отмена» → refused", dec.kind === "refused");
+  check("«нет, отмена» → план СОЖЖЁН, несмотря на button-only", r.store.manifests.get(r.id).status === "INVALIDATED", r.store.manifests.get(r.id).status);
+  check("статус кнопки даже не запрашивался (отрицание раньше)", r.gate.calls.check === 0, String(r.gate.calls.check));
+}
+
+// ── 28. РЕШЕНИЕ ПО СОСТОЯНИЮ ПЛАНА, А НЕ ПО ТЕКУЩЕЙ НАСТРОЙКЕ ───────────────
+// Тест, различающий две реализации: план ушёл кнопкой → слой ВЫКЛЮЧИЛИ →
+// текстовый путь обязан остаться закрытым. Реализация, читающая `enabledFor`
+// или env в момент исполнения, здесь исполнит мутацию.
+console.log("\n[28] слой выключили ПОСЛЕ отправки плана → текстовый путь всё равно закрыт");
+{
+  const { store, id } = await buildButtonPlan();
+  // «Выключили» в самом жёстком виде: гейта в вызове больше нет вообще.
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash, store, cfg });
+  check("tg отсутствует, но план ушёл кнопкой → refused", dec.kind === "refused", dec.kind);
+  check("мутация НЕ исполнена", store.manifests.get(id).status === "AWAITING_CONSENT", store.manifests.get(id).status);
+  check("отказ по-прежнему про кнопку", dec.result?.includes("кнопк"), dec.result?.slice(0, 80));
+
+  // И более мягкий вариант: гейт есть, но enabledFor теперь false.
+  const r2 = await buildButtonPlan();
+  const offGate = makeTgGate({ enabled: false, approval: "approved" });
+  const dec2 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: r2.id, userReply: "да", plan, rehash, store: r2.store, cfg, tg: offGate });
+  check("enabledFor=false, но метка стоит → всё равно refused", dec2.kind === "refused", dec2.kind);
+  check("и план не погашен (approved ждёт фон)", r2.store.manifests.get(r2.id).status === "AWAITING_CONSENT");
+}
+
+// ── 29. СОВМЕСТИМОСТЬ: без Telegram-слоя всё ровно как раньше ───────────────
+console.log("\n[29] Telegram выключен → обычный текстовый путь работает как прежде");
+{
+  // Метка не ставится никогда ⇒ button-only всегда false. Иначе тот, кто
+  // развернул сервер без Telegram, остался бы вообще без способа что-либо
+  // сделать.
+  const { store, dec: planned } = await buildPlan();
+  clock.t += 6_000;
+  const gate = makeTgGate({ enabled: false });
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: planned.manifestId, userReply: "да", plan, rehash, store, cfg, tg: gate });
+  check("текстовое «да» ИСПОЛНЯЕТ", dec.kind === "confirmed", dec.kind);
+  check("статус кнопки не запрашивался НИ РАЗУ", gate.calls.check === 0, String(gate.calls.check));
+
+  // И отказ по-прежнему остаётся отказом.
+  const p2 = await buildPlan();
+  clock.t += 6_000;
+  const dec2 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: p2.dec.manifestId, userReply: "нет, отмена", plan, rehash, store: p2.store, cfg, tg: makeTgGate({ enabled: false }) });
+  check("«нет, отмена» → refused", dec2.kind === "refused");
+  check("«нет, отмена» → план сожжён", p2.store.manifests.get(p2.dec.manifestId).status === "INVALIDATED");
+}
+
+// ── 30. мягкая деградация: метка есть, исполнителя нет → старый путь ────────
+console.log("\n[30] тул без авто-исполнителя: остаётся обычный путь «кнопка + текстовое да»");
+{
+  const r = await buildButtonPlan("sheets_clear_range");
+  check("метка стоит", r.store.manifests.get(r.id).tgNotified === true);
+  check("но button-only не сработал (нет исполнителя)", tgButtonOnly({ tool: "sheets_clear_range", tgNotified: true }) === false);
+  // pending → отказ «жду подтверждения» (старый блок 3.5), план жив
+  const dec = await requireConsent({ tool: "sheets_clear_range", accountLabel: "work", manifestId: r.id, userReply: "да", plan, rehash, store: r.store, cfg, tg: r.gate });
+  check("pending → refused «жду подтверждения»", dec.kind === "refused" && dec.result?.includes("Жду подтверждения"), dec.result?.slice(0, 80));
+  // approved → текстовое «да» ИСПОЛНЯЕТ (иначе такой тул стал бы неисполнимым)
+  r.gate.setApproval("approved");
+  const dec2 = await requireConsent({ tool: "sheets_clear_range", accountLabel: "work", manifestId: r.id, userReply: "да", plan, rehash, store: r.store, cfg, tg: r.gate });
+  check("approved + нет исполнителя → текстовое «да» исполняет", dec2.kind === "confirmed", dec2.kind);
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
