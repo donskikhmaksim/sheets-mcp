@@ -396,13 +396,42 @@ export interface TgApprovalConfig {
    * so a deployer can never accidentally flip it true by editing code.
    */
   webhookOwner: boolean;
+  /**
+   * Env TG_BOT_TOKEN_OVERRIDE, default false (derived, not its own env var —
+   * see `botToken` below). Full backward-compat escape hatch (Maksim,
+   * 2026-08-06): each of the 6 MCP servers can be handed its OWN Telegram bot
+   * token instead of sharing the one `TG_BOT_TOKEN` + the `webhookOwner`
+   * routing dance. When `true`, THIS server's `/tg/webhook` is gated open
+   * (`http.ts`) and `registerWebhook` registers it on its OWN bot
+   * (`tg_approval.ts`) regardless of `webhookOwner`, and `handleWebhook`
+   * consumes decisions SERVER-SCOPED (`store.consumeTgDecision`, not the
+   * shared-bot `consumeTgDecisionAnyServer`) — this server's manifests can
+   * never be confused with another server's, because Telegram itself is only
+   * routing updates for THIS bot's token to THIS server. Unset (default
+   * false) => byte-for-byte the old shared-bot behaviour; unsetting
+   * `TG_BOT_TOKEN_OVERRIDE` again is a full rollback with no redeploy needed
+   * beyond the env change itself.
+   */
+  ownBot: boolean;
 }
 
 export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   const enabled = process.env.TG_APPROVAL_ENABLED?.trim().toLowerCase() === "true";
-  const botToken = process.env.TG_BOT_TOKEN?.trim() || "";
+  const botTokenOverride = process.env.TG_BOT_TOKEN_OVERRIDE?.trim() || "";
+  const botToken = botTokenOverride || process.env.TG_BOT_TOKEN?.trim() || "";
+  const ownBot = !!botTokenOverride;
   const ownerChatId = process.env.TG_OWNER_CHAT_ID?.trim() || "";
-  const webhookSecret = process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() || "";
+  // TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE mirrors TG_BOT_TOKEN_OVERRIDE's
+  // opt-in-per-server shape: unset (default) => the shared secret, same as
+  // today. A server with its own bot (`ownBot`) MAY also get its own webhook
+  // secret this way, so a leak of one server's secret doesn't let an attacker
+  // probe every other server's `/tg/webhook` too — but it's not required:
+  // the shared secret still works for an `ownBot` server that doesn't bother
+  // setting the override (see the port instructions' §5 rationale).
+  const webhookSecret =
+    process.env.TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE?.trim() ||
+    process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() ||
+    "";
   const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
   const publicBaseUrl =
     process.env.PUBLIC_BASE_URL?.trim() || (railwayDomain ? `https://${railwayDomain}` : "");
@@ -423,9 +452,9 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   // feature or serve mutations without the second factor it claims to enforce.
   if (enabled && (!botToken || !ownerChatId || !webhookSecret || !publicBaseUrl)) {
     const missing = [
-      !botToken && "TG_BOT_TOKEN",
+      !botToken && "TG_BOT_TOKEN (or TG_BOT_TOKEN_OVERRIDE)",
       !ownerChatId && "TG_OWNER_CHAT_ID",
-      !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET",
+      !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET (or TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE)",
       !publicBaseUrl && "PUBLIC_BASE_URL (or RAILWAY_PUBLIC_DOMAIN)",
     ]
       .filter(Boolean)
@@ -446,6 +475,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
     toolsAllowlist,
     ttlMs,
     webhookOwner,
+    ownBot,
   };
 }
 

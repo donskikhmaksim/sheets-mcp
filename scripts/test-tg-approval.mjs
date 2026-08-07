@@ -114,6 +114,7 @@ function tgCfg(overrides = {}) {
     toolsAllowlist: null,
     ttlMs: 3_600_000,
     webhookOwner: false, // sheets-mcp is NEVER the owner in production (gmail-mcp is)
+    ownBot: false, // TG_BOT_TOKEN_OVERRIDE unset by default — shared-bot behaviour
     ...overrides,
   };
 }
@@ -474,6 +475,114 @@ console.log("\n[13] registerWebhook: TG_WEBHOOK_OWNER не установлен/
   // именно УСЛОВНЫЙ, а не сломанный навсегда.)
   await registerWebhook(tgCfg({ enabled: true, webhookOwner: true }));
   check("webhookOwner=true → setWebhook ВЫЗВАН ровно один раз", tgCalls.filter((c) => c.method === "setWebhook").length === 1);
+}
+
+// ═══ [14] ownBot=true (TG_BOT_TOKEN_OVERRIDE): handleWebhook consumes SERVER-SCOPED ═══
+// A server with its own bot token never shares `/tg/webhook` with anyone
+// else — Telegram only ever routes ITS bot's updates here. `handleWebhook`
+// must therefore use the server-scoped `consumeTgDecision(manifestId,
+// cfg.server, ...)`, not the shared-bot `consumeTgDecisionAnyServer`.
+console.log("\n[14] ownBot=true: handleWebhook consumes via server-scoped consumeTgDecision");
+{
+  const { mock } = resetTelegramMocks();
+  mock("answerCallbackQuery", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+
+  const cfg = tgCfg({ ownBot: true, webhookOwner: false, server: "sheets" });
+  const tgStore = makeTgStore();
+  await tgStore.createTgApproval({
+    manifestId: "m-ownbot-happy",
+    server: "sheets", // this server's own manifest — the only kind ownBot's webhook should ever see
+    chatId: cfg.ownerChatId,
+    messageId: 77,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+
+  const update = {
+    callback_query: {
+      id: "cbq-ownbot-happy",
+      from: { id: Number(cfg.ownerChatId) },
+      data: "a:m-ownbot-happy",
+      message: { message_id: 77, chat: { id: cfg.ownerChatId } },
+    },
+  };
+  await handleWebhook(cfg, tgStore, update);
+
+  const row = tgStore.approvals.get("m-ownbot-happy");
+  check("ownBot happy-path: own manifest gets consumed to APPROVED", row.status === "APPROVED", JSON.stringify(row));
+  check("editMessageReplyMarkup called — buttons cleared", tgCalls.some((c) => c.method === "editMessageReplyMarkup"));
+}
+
+console.log("\n[14b] ownBot=true: handleWebhook does NOT consume a manifest belonging to a DIFFERENT server");
+{
+  // Defense-in-depth regression: even if a manifest_id from another server's
+  // rows somehow reached this webhook (should never happen structurally —
+  // Telegram only routes this bot's own updates here), the server-scoped
+  // consume must refuse it rather than silently deciding someone else's
+  // approval — the opposite behaviour of the shared-bot `AnyServer` path.
+  const { mock } = resetTelegramMocks();
+  mock("answerCallbackQuery", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+
+  const cfg = tgCfg({ ownBot: true, webhookOwner: false, server: "sheets" });
+  const tgStore = makeTgStore();
+  await tgStore.createTgApproval({
+    manifestId: "m-ownbot-foreign",
+    server: "calendar", // belongs to a DIFFERENT server's own-bot deployment
+    chatId: cfg.ownerChatId,
+    messageId: 88,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+
+  const update = {
+    callback_query: {
+      id: "cbq-ownbot-foreign",
+      from: { id: Number(cfg.ownerChatId) },
+      data: "a:m-ownbot-foreign",
+      message: { message_id: 88, chat: { id: cfg.ownerChatId } },
+    },
+  };
+  await handleWebhook(cfg, tgStore, update);
+
+  const row = tgStore.approvals.get("m-ownbot-foreign");
+  check(
+    "ownBot server-scoped consume refuses a foreign-server manifest — stays PENDING",
+    row.status === "PENDING",
+    JSON.stringify(row),
+  );
+  check(
+    "editMessageReplyMarkup NOT called — nothing was actually consumed",
+    tgCalls.filter((c) => c.method === "editMessageReplyMarkup").length === 0,
+  );
+  check(
+    "answerCallbackQuery still called (spinner clears with \"already handled\")",
+    tgCalls.filter((c) => c.method === "answerCallbackQuery" && c.body.text === "Уже обработано").length === 1,
+  );
+}
+
+console.log("\n[15] registerWebhook: ownBot=true registers its OWN webhook even with webhookOwner=false");
+{
+  const { mock } = resetTelegramMocks();
+  mock("setWebhook", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  // (a) ownBot=true, webhookOwner=false (the expected real-world combination
+  // for a server that opted into its own bot) => setWebhook IS called.
+  await registerWebhook(tgCfg({ enabled: true, ownBot: true, webhookOwner: false }));
+  check("ownBot=true, webhookOwner=false → setWebhook IS called", tgCalls.filter((c) => c.method === "setWebhook").length === 1);
+}
+
+console.log("\n[15b] registerWebhook: ownBot=false + webhookOwner=false (default, TG_BOT_TOKEN_OVERRIDE unset) → still no-op");
+{
+  const { mock } = resetTelegramMocks();
+  mock("setWebhook", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  await registerWebhook(tgCfg({ enabled: true, ownBot: false, webhookOwner: false }));
+  check(
+    "ownBot=false, webhookOwner=false → setWebhook NOT called (full backward compat, unchanged from [13])",
+    tgCalls.filter((c) => c.method === "setWebhook").length === 0,
+  );
 }
 
 // ── итог ─────────────────────────────────────────────────────────────────

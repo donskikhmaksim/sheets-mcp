@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { loadConfig } from "./config.js";
+import { loadConfig, loadTgApprovalConfig } from "./config.js";
 
 // Every env var loadConfig/loadOnboarding might read, so each test starts clean
 // regardless of what's exported in the shell running these tests.
@@ -27,6 +27,15 @@ const RELEVANT_KEYS = [
   "GOOGLE_SERVICE_ACCOUNT_JSON",
   "GOOGLE_SERVICE_ACCOUNT_BASE64",
   "GMAIL_DEFAULT_QUERY",
+  "TG_APPROVAL_ENABLED",
+  "TG_BOT_TOKEN",
+  "TG_BOT_TOKEN_OVERRIDE",
+  "TG_OWNER_CHAT_ID",
+  "TG_APPROVAL_WEBHOOK_SECRET",
+  "TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE",
+  "TG_APPROVAL_TOOLS",
+  "TG_APPROVAL_TTL_MS",
+  "TG_WEBHOOK_OWNER",
 ];
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
@@ -106,5 +115,75 @@ test("OWNER_EMAILS unset => allowlist disabled (undefined), fail-open for other 
   withEnv({ ...ONBOARDING_BASE }, () => {
     const config = loadConfig();
     assert.equal(config.onboarding.ownerEmails, undefined);
+  });
+});
+
+// ── loadTgApprovalConfig: TG_BOT_TOKEN_OVERRIDE (own-bot-per-server escape hatch) ──
+
+const TG_APPROVAL_BASE = {
+  TG_APPROVAL_ENABLED: "true",
+  TG_BOT_TOKEN: "shared-bot-token",
+  TG_OWNER_CHAT_ID: "555",
+  TG_APPROVAL_WEBHOOK_SECRET: "shared-webhook-secret",
+  PUBLIC_BASE_URL: "https://example.test",
+};
+
+test("TG_BOT_TOKEN_OVERRIDE unset => byte-for-byte the old shared-bot config (ownBot=false, botToken/webhookSecret from the shared vars)", () => {
+  withEnv({ ...TG_APPROVAL_BASE }, () => {
+    const cfg = loadTgApprovalConfig("sheets");
+    assert.equal(cfg.ownBot, false);
+    assert.equal(cfg.botToken, "shared-bot-token");
+    assert.equal(cfg.webhookSecret, "shared-webhook-secret");
+  });
+});
+
+test("TG_BOT_TOKEN_OVERRIDE set => ownBot=true and botToken is the override, even though TG_BOT_TOKEN is also set", () => {
+  withEnv({ ...TG_APPROVAL_BASE, TG_BOT_TOKEN_OVERRIDE: "own-bot-token" }, () => {
+    const cfg = loadTgApprovalConfig("sheets");
+    assert.equal(cfg.ownBot, true);
+    assert.equal(cfg.botToken, "own-bot-token");
+  });
+});
+
+test("TG_BOT_TOKEN_OVERRIDE set alone (no TG_BOT_TOKEN at all) => still resolves, ownBot=true", () => {
+  withEnv({ ...TG_APPROVAL_BASE, TG_BOT_TOKEN: undefined, TG_BOT_TOKEN_OVERRIDE: "own-bot-token" }, () => {
+    const cfg = loadTgApprovalConfig("sheets");
+    assert.equal(cfg.ownBot, true);
+    assert.equal(cfg.botToken, "own-bot-token");
+  });
+});
+
+test("TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE unset => falls back to the shared TG_APPROVAL_WEBHOOK_SECRET even with ownBot=true", () => {
+  withEnv({ ...TG_APPROVAL_BASE, TG_BOT_TOKEN_OVERRIDE: "own-bot-token" }, () => {
+    const cfg = loadTgApprovalConfig("sheets");
+    assert.equal(cfg.webhookSecret, "shared-webhook-secret");
+  });
+});
+
+test("TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE set => wins over the shared TG_APPROVAL_WEBHOOK_SECRET", () => {
+  withEnv(
+    { ...TG_APPROVAL_BASE, TG_BOT_TOKEN_OVERRIDE: "own-bot-token", TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE: "own-secret" },
+    () => {
+      const cfg = loadTgApprovalConfig("sheets");
+      assert.equal(cfg.webhookSecret, "own-secret");
+    },
+  );
+});
+
+test("ownBot=true + missing TG_OWNER_CHAT_ID => still throws loudly (own-bot mode doesn't relax the other required fields)", () => {
+  withEnv(
+    { ...TG_APPROVAL_BASE, TG_OWNER_CHAT_ID: undefined, TG_BOT_TOKEN_OVERRIDE: "own-bot-token" },
+    () => {
+      assert.throws(() => loadTgApprovalConfig("sheets"), /TG_OWNER_CHAT_ID/);
+    },
+  );
+});
+
+test("TG_APPROVAL_ENABLED=false => ownBot is still computed from TG_BOT_TOKEN_OVERRIDE alone (independent of the enabled flag)", () => {
+  withEnv({ TG_APPROVAL_ENABLED: "false", TG_BOT_TOKEN_OVERRIDE: "own-bot-token" }, () => {
+    const cfg = loadTgApprovalConfig("sheets");
+    assert.equal(cfg.enabled, false);
+    assert.equal(cfg.ownBot, true);
+    assert.equal(cfg.botToken, "own-bot-token");
   });
 });

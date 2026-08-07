@@ -56,7 +56,7 @@ const WEBHOOK_SECRET = "wh-secret-xyz";
 
 // ── worker mode: run ONE scenario in this (child) process, print result JSON ──
 async function runWorker() {
-  const scenario = process.env.TG_TEST_WORKER; // "owner-false" | "owner-true"
+  const scenario = process.env.TG_TEST_WORKER; // "owner-false" | "owner-true" | "ownbot-true" | ...
   const port = Number(process.env.TG_TEST_PORT);
 
   const { MockAgent, setGlobalDispatcher } = await import("undici");
@@ -144,7 +144,7 @@ function runOrchestrator() {
     if (!cond) failures++;
   };
 
-  function spawnScenario(scenario, port, webhookOwnerEnv) {
+  function spawnScenario(scenario, port, webhookOwnerEnv, extraEnv = {}) {
     const result = spawnSync(process.execPath, [THIS_FILE], {
       encoding: "utf8",
       env: {
@@ -158,6 +158,7 @@ function runOrchestrator() {
         PUBLIC_BASE_URL: "https://example.test",
         ...(webhookOwnerEnv === null ? {} : { TG_WEBHOOK_OWNER: webhookOwnerEnv }),
         DATABASE_URL: "",
+        ...extraEnv,
       },
       timeout: 15_000,
     });
@@ -226,6 +227,52 @@ function runOrchestrator() {
         r,
       );
       check("registerWebhook по-прежнему вызывает setWebhook ровно один раз при старте (happy path не сломан)", r.setWebhookCalls === 1, r.setWebhookCalls);
+    }
+  }
+
+  // ═══ [d] TG_BOT_TOKEN_OVERRIDE set, TG_WEBHOOK_OWNER unset (default) → 200, handler DOES run ═══
+  // The own-bot escape hatch (Максим, 2026-08-06): a server with its own bot
+  // token opens its OWN /tg/webhook independently of the shared-bot
+  // TG_WEBHOOK_OWNER routing. This proves the new `ownBot` branch of the
+  // route gate (`!tgApprovalConfig.webhookOwner && !tgApprovalConfig.ownBot`)
+  // actually opens the route — the case [a]/[b] prove it stays CLOSED without
+  // TG_BOT_TOKEN_OVERRIDE.
+  console.log("\n[d] TG_BOT_TOKEN_OVERRIDE задан, TG_WEBHOOK_OWNER не задан → 200, handler ВЫЗЫВАЕТСЯ (own-bot route)");
+  {
+    const r = spawnScenario("ownbot-true", 34973, null, { TG_BOT_TOKEN_OVERRIDE: BOT_TOKEN });
+    check("worker завершился и вернул результат", !!r, "worker crashed or printed no JSON");
+    if (r) {
+      check("статус 200", r.status === 200, r.status);
+      check(
+        "handleWebhook РЕАЛЬНО вызывался ровно один раз (ровно одна строка 'TG approval webhook error:')",
+        r.handlerErrorLineCount === 1,
+        r.handlerErrorLineCount,
+      );
+      check(
+        "вызов дошёл до store.consumeTgDecision (упал на 'Store not initialised', а не раньше)",
+        r.reachedStoreNotInitialised === true,
+        r,
+      );
+      check("registerWebhook регистрирует СВОЙ вебхук (setWebhook вызван ровно один раз)", r.setWebhookCalls === 1, r.setWebhookCalls);
+    }
+  }
+
+  // ═══ [e] TG_BOT_TOKEN_OVERRIDE unset, TG_WEBHOOK_OWNER=false explicit → 404 (full backward compat) ═══
+  // Same as [a]/[b] but stated explicitly against the new gate expression,
+  // not just the old one — belt-and-suspenders for the exact condition that
+  // changed in http.ts.
+  console.log("\n[e] TG_BOT_TOKEN_OVERRIDE НЕ задан + webhookOwner=false → 404 (полная обратная совместимость)");
+  {
+    const r = spawnScenario("ownbot-false-control", 34974, "false");
+    check("worker завершился и вернул результат", !!r, "worker crashed or printed no JSON");
+    if (r) {
+      check("статус 404", r.status === 404, r.status);
+      check(
+        "handleWebhook НЕ вызывался",
+        r.handlerErrorLineCount === 0,
+        r.handlerErrorLineCount,
+      );
+      check("setWebhook при старте не вызывался", r.setWebhookCalls === 0, r.setWebhookCalls);
     }
   }
 
