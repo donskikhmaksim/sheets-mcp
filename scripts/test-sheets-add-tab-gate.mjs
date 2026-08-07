@@ -165,7 +165,7 @@ console.log("\n[1] sheets_add_tab: happy path — план → подтверж�
   const execBody = text(execResp);
   console.log("  EXEC RAW:", execBody.slice(0, 700));
   check("batchUpdate вызван ровно 1 раз", world.batchUpdateCalls.length === 1, String(world.batchUpdateCalls.length));
-  check("summary показывает 1/1 с иконкой 📑", execBody.includes('"summary": "📑 Added 1/1"'), execBody.slice(0, 100));
+  check("summary показывает 1/1 с иконкой 📑", execBody.includes('"summary": "📑 Добавлено 1/1"'), execBody.slice(0, 100));
 
   let parsed;
   try { parsed = JSON.parse(execBody); } catch { parsed = null; }
@@ -216,7 +216,7 @@ console.log("\n[2] sheets_add_tab: batchUpdate кидает ошибку — з�
   const execResp = await cli.callTool({ name: "sheets_add_tab", arguments: { manifest_id: manifestId, user_reply: "да" } });
   const execBody = text(execResp);
   console.log("  EXEC RAW (forced error):", execBody.slice(0, 500));
-  check("summary отражает провал (0/1, иконка ⚠️)", execBody.includes('"summary": "⚠️ Added 0/1 (1 с ошибкой)"'), execBody.slice(0, 100));
+  check("summary отражает провал (0/1, иконка ⚠️)", execBody.includes('"summary": "⚠️ Добавлено 0/1 (1 с ошибкой)"'), execBody.slice(0, 100));
   let parsed;
   try { parsed = JSON.parse(execBody); } catch { parsed = null; }
   check("results[0].error содержит текст ошибки Google", parsed?.results?.[0]?.error?.includes("already exists"), JSON.stringify(parsed?.results));

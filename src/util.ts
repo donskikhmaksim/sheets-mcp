@@ -6,7 +6,23 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 export function ok(data: unknown): CallToolResult {
   const text =
     typeof data === "string" ? data : JSON.stringify(data, null, 2);
-  return { content: [{ type: "text", text }] };
+  // `structuredContent` is a standard MCP field (CallToolResultSchema) meant
+  // for exactly this: a machine-readable twin of the same data, alongside the
+  // human-facing text. Attached for every object payload (never for a plain
+  // string result, and never for an array — both lack the named-field shape
+  // report.ts's renderStructuredReport expects) so report.ts's
+  // renderAutoExecuteReport can build a real markdown report for the
+  // Telegram auto-execute path (see that file's top comment) WITHOUT parsing
+  // `text` back out of JSON. `content[0].text` is unchanged — a normal MCP
+  // client (Claude in chat) keeps seeing exactly the JSON it saw before.
+  const structuredContent =
+    typeof data === "object" && data !== null && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : undefined;
+  return {
+    content: [{ type: "text", text }],
+    ...(structuredContent ? { structuredContent } : {}),
+  };
 }
 
 export function fail(error: unknown): CallToolResult {

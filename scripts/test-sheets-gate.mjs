@@ -160,7 +160,7 @@ console.log("\n[1] sheets_write_range: full plan→confirm round trip, mutation 
 
   const execResp = await cli.callTool({ name: "sheets_write_range", arguments: { manifest_id: manifestId, user_reply: "да, пиши" } });
   const execBody = text(execResp);
-  check("execute succeeds — summary shows 1/1, no error", execBody.includes('"summary": "✏️ Written 1/1"'), execBody.slice(0, 60));
+  check("execute succeeds — summary shows 1/1, no error", execBody.includes('"summary": "✏️ Записано 1/1"'), execBody.slice(0, 60));
   check("world IS mutated", world.ranges.get("S1").get("Sheet1!A1")[0][0] === "new value");
   check("post-verify report attached with ✅", execBody.includes("Независимая проверка записи") && execBody.includes("✅"));
   check("human-readable output: result item carries the spreadsheet's title, not just its raw id", execBody.includes('"spreadsheetTitle": "My Sheet"'), execBody.slice(0, 400));
@@ -184,7 +184,7 @@ console.log("\n[1b] sheets_write_range: 2 items, same spreadsheetId → title fe
   const beforeExecuteCalls = world.titleOnlyGetCalls.count;
   const execResp = await cli.callTool({ name: "sheets_write_range", arguments: { manifest_id: manifestId, user_reply: "да" } });
   const execBody = text(execResp);
-  check("execute succeeds — summary shows 2/2", execBody.includes('"summary": "✏️ Written 2/2"'), execBody.slice(0, 60));
+  check("execute succeeds — summary shows 2/2", execBody.includes('"summary": "✏️ Записано 2/2"'), execBody.slice(0, 60));
   check(
     "title fetched exactly once during execute for 2 items sharing one spreadsheetId (not 0, not 2)",
     world.titleOnlyGetCalls.count - beforeExecuteCalls === 1,

@@ -15,6 +15,7 @@ import { ok, fail, guard, safeText } from "../util.js";
 import { getAutoExecuteClients, type UserClients } from "../accounts.js";
 import { requireConsent, sha256, USER_REPLY_DOC, type ConsentStore } from "../consent.js";
 import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
+import { renderAutoExecuteReport } from "../report.js";
 import type { SheetsConsentContext } from "./sheets.js";
 
 const SPREADSHEET_ID = "1o40fK-fF5Yh-y-iIGbYdvj8hiCKWzJ1yuJcBCA3NlYk";
@@ -94,13 +95,11 @@ async function liveRowSnapshot(g: ReturnType<UserClients["resolve"]>, id: number
   return { sheetRow: idx + 1, from: row[3] ?? "", subject: row[4] ?? "", maksimSaid: row[6] ?? "", whyNotClosed: row[7] ?? "", status: row[8] ?? "" };
 }
 
-/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
- * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn).
- * Ported from gmail-mcp's tools/gmail.ts (same helper as tools/sheets.ts's). */
-function extractText(result: CallToolResult): string {
-  const first = result.content?.[0];
-  return first && first.type === "text" ? first.text : JSON.stringify(result);
-}
+// Human-readable Telegram-report extraction now lives in `../report.js`'s
+// `renderAutoExecuteReport` — see that file's top comment (task #131,
+// 2026-08-06: the old local `extractText` here returned raw
+// `JSON.stringify`'d text for Telegram whenever the payload was an object,
+// same bug as tools/sheets.ts's).
 
 // ── Auto-execute cores (Максим, 2026-08-05) ──────────────────────────────────
 // Same extraction pattern as tools/sheets.ts: pulled out of the tool body
@@ -150,11 +149,11 @@ async function executeTriageLogAddCore(
   await consentStore
     .updateConsentAuditOutcome(auditId, {
       outcome: "confirmed",
-      postVerify: `${icon} added IDs ${addedIds.join(", ")}${verified ? " — confirmed in sheet" : " — could not re-verify"}`,
+      postVerify: `${icon} добавлены ID ${addedIds.join(", ")}${verified ? " — подтверждено в таблице" : " — не удалось перепроверить"}`,
     })
     .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
   return ok({
-    summary: `${icon} Added ${newRows.length} row(s) to Triage Log (IDs: ${addedIds.join(", ")})`,
+    summary: `${icon} Добавлено строк в Triage Log: ${newRows.length} (ID: ${addedIds.join(", ")})`,
     addedIds,
     date: payload.today,
   });
@@ -173,7 +172,7 @@ registerAutoExecutor("triage_log_add", {
     const p = payload as AddPayload;
     const g = ctx.clients.resolve();
     const result = await executeTriageLogAddCore(g, ctx.clients.defaultName, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -184,7 +183,7 @@ async function executeTriageLogUpdateCore(
   consentStore: ConsentStore,
 ): Promise<CallToolResult> {
   const snap = await liveRowSnapshot(g, payload.id);
-  if (!snap) return fail(`Triage log entry with ID ${payload.id} not found (изменилось между планом и исполнением).`);
+  if (!snap) return fail(`Запись Triage Log с ID ${payload.id} не найдена (изменилось между планом и исполнением).`);
 
   const data: { range: string; values: string[][] }[] = [];
   if (payload.maksimSaid !== undefined)   data.push({ range: `${SHEET_NAME}!G${snap.sheetRow}`, values: [[payload.maksimSaid]] });
@@ -199,9 +198,9 @@ async function executeTriageLogUpdateCore(
   // Post-verify: SEPARATE fresh read confirming the new values landed.
   const after = await liveRowSnapshot(g, payload.id);
   const mismatches = [
-    payload.status !== undefined && after?.status !== payload.status ? "status" : null,
-    payload.maksimSaid !== undefined && after?.maksimSaid !== payload.maksimSaid ? "maksimSaid" : null,
-    payload.whyNotClosed !== undefined && after?.whyNotClosed !== payload.whyNotClosed ? "whyNotClosed" : null,
+    payload.status !== undefined && after?.status !== payload.status ? "статус" : null,
+    payload.maksimSaid !== undefined && after?.maksimSaid !== payload.maksimSaid ? "«Maksim said»" : null,
+    payload.whyNotClosed !== undefined && after?.whyNotClosed !== payload.whyNotClosed ? "«why not closed»" : null,
   ].filter(Boolean);
   const icon = !after ? "⚠️" : mismatches.length ? "❌" : "✅";
   await consentStore
@@ -213,7 +212,7 @@ async function executeTriageLogUpdateCore(
     .catch((e) => console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e)));
 
   return ok({
-    summary: `${icon} Updated Triage Log #${payload.id}${payload.status ? ` → ${payload.status}` : ""}`,
+    summary: `${icon} Обновлена запись Triage Log #${payload.id}${payload.status ? ` → ${payload.status}` : ""}`,
     id: payload.id,
     sheetRow: snap.sheetRow,
     updated: {
@@ -237,7 +236,7 @@ registerAutoExecutor("triage_log_update", {
     const p = payload as UpdatePayload;
     const g = ctx.clients.resolve();
     const result = await executeTriageLogUpdateCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 

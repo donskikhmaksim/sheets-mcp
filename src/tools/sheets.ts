@@ -19,6 +19,7 @@ import {
   type TgApprovalGate,
 } from "../consent.js";
 import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
+import { renderAutoExecuteReport } from "../report.js";
 
 /** One row of the shared consent_audit log, as read by `sheets_consent_audit`.
  * Mirrors store.ts's `ConsentAuditRow` structurally — same "don't import
@@ -711,13 +712,12 @@ async function formatBindingSnapshot(g: GoogleClients, items: FormatItem[]) {
   });
 }
 
-/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
- * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn).
- * Ported from gmail-mcp's tools/gmail.ts. */
-function extractText(result: CallToolResult): string {
-  const first = result.content?.[0];
-  return first && first.type === "text" ? first.text : JSON.stringify(result);
-}
+// Human-readable Telegram-report extraction now lives in `../report.js`'s
+// `renderAutoExecuteReport` (task #131, 2026-08-06 — the old `extractText`
+// here just returned `result.content[0].text`, which for any object payload
+// IS `JSON.stringify(data, null, 2)` — raw JSON, including a model-directive
+// line from `renderVerifyReport`'s `verification`, reached Telegram
+// unfiltered). See that file's top comment for the full story.
 
 // ── Auto-execute cores (Максим, 2026-08-05) ──────────────────────────────────
 // Ядро исполнения каждого гейтованного тула — вынесено из тела тула (после
@@ -782,7 +782,7 @@ async function executeWriteRangeCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Written",
+    verb: "Записано",
     summaryIcon: "✏️",
     verify: (r) => postVerifyRangeWritten(g, r.spreadsheetId, r.range!, payload.items.find((it) => it.spreadsheetId === r.spreadsheetId && it.range === r.range)?.values ?? []),
     reportTitle: "Независимая проверка записи",
@@ -810,7 +810,7 @@ registerAutoExecutor("sheets_write_range", {
     const p = payload as WriteRangePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeWriteRangeCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -841,7 +841,7 @@ async function executeAppendRowsCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Appended",
+    verb: "Добавлено",
     summaryIcon: "➕",
     verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, null, r.updatedRange ?? r.spreadsheetId),
     reportTitle: "Независимая проверка добавления строк",
@@ -865,7 +865,7 @@ registerAutoExecutor("sheets_append_rows", {
     const p = payload as AppendRowsPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeAppendRowsCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -890,7 +890,7 @@ async function executeClearRangeCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Cleared",
+    verb: "Очищено",
     summaryIcon: "🧹",
     verify: (r) => postVerifyRangeCleared(g, r.spreadsheetId, r.range!),
     reportTitle: "Независимая проверка очистки",
@@ -915,7 +915,7 @@ registerAutoExecutor("sheets_clear_range", {
     const p = payload as ClearRangePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeClearRangeCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -951,7 +951,7 @@ async function executeCreateCore(
   return buildMutationResult({
     results,
     total: payload.spreadsheets.length,
-    verb: "Created",
+    verb: "Создано",
     summaryIcon: "📄",
     verify: (r) => postVerifySpreadsheetIdentity(g, r.spreadsheetId, r.title, r.title),
     reportTitle: "Независимая проверка создания",
@@ -970,7 +970,7 @@ registerAutoExecutor("sheets_create", {
     const p = payload as CreatePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeCreateCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -999,7 +999,7 @@ async function executeAddTabCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Added",
+    verb: "Добавлено",
     summaryIcon: "📑",
     verify: (r) => postVerifyTabExists(g, r.spreadsheetId, r.title!),
     reportTitle: "Независимая проверка добавления вкладки",
@@ -1023,7 +1023,7 @@ registerAutoExecutor("sheets_add_tab", {
     const p = payload as AddTabPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeAddTabCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -1088,8 +1088,8 @@ async function executeFindReplaceCore(
   const worst = worstOutcome(pv);
   const icon = execError ? "❌" : worst === "mismatch" ? "❌" : worst === "warn" ? "⚠️" : "🔁";
   const summary = execError
-    ? `❌ Find&replace failed: ${execError}`
-    : `${icon} Replaced "${payload.find}" -> "${payload.replace}" — ${fr.occurrencesChanged ?? preMatches.length} occurrence(s)${payload.sheetId !== undefined ? ` (sheet ${payload.sheetId})` : " (all sheets)"}`;
+    ? `❌ Ошибка при замене: ${safeText(execError, 200)}`
+    : `${icon} Заменено «${safeText(payload.find, 60)}» → «${safeText(payload.replace, 60)}» — совпадений: ${fr.occurrencesChanged ?? preMatches.length}${payload.sheetId !== undefined ? ` (вкладка ${payload.sheetId})` : " (все вкладки)"}`;
   if (consentStore && auditId) {
     await consentStore
       .updateConsentAuditOutcome(auditId, {
@@ -1129,7 +1129,7 @@ registerAutoExecutor("sheets_find_replace", {
     const p = payload as FindReplacePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeFindReplaceCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -1204,7 +1204,7 @@ async function executeFormatRangeCore(
   return buildMutationResult({
     results,
     total: approvedItems.length,
-    verb: "Formatted",
+    verb: "Отформатировано",
     summaryIcon: "🎨",
     verify: (r) => {
       const it = approvedItems.find((x) => x.spreadsheetId === r.spreadsheetId && x.range === r.range)!;
@@ -1235,7 +1235,7 @@ registerAutoExecutor("sheets_format_range", {
     const p = payload as FormatRangePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeFormatRangeCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 
@@ -1266,8 +1266,8 @@ async function executeRawBatchCore(
   ]);
   const icon = execError ? "❌" : "⚠️"; // always ⚠️ on success — honest limit, see postVerifyRawBatchApplied
   const summary = execError
-    ? `❌ Raw batchUpdate failed: ${execError}`
-    : `${icon} Applied ${payload.requests.length} raw request(s) to spreadsheet`;
+    ? `❌ Ошибка batchUpdate: ${safeText(execError, 200)}`
+    : `${icon} Применено низкоуровневых запросов к таблице: ${payload.requests.length}`;
   if (consentStore && auditId) {
     await consentStore
       .updateConsentAuditOutcome(auditId, {
@@ -1299,7 +1299,7 @@ registerAutoExecutor("sheets_raw_batch_update", {
     const p = payload as RawBatchPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeRawBatchCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return renderAutoExecuteReport(result);
   },
 });
 

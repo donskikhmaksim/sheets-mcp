@@ -173,7 +173,7 @@ console.log("\n[1] sheets_create: happy path — план → подтвержд
   const execBody = text(execResp);
   console.log("  EXEC RAW:", execBody.slice(0, 800));
   check("create вызван ровно 1 раз", world.createCalls.length === 1, String(world.createCalls.length));
-  check("summary показывает 1/1 с иконкой 📄", execBody.includes('"summary": "📄 Created 1/1"'), execBody.slice(0, 100));
+  check("summary показывает 1/1 с иконкой 📄", execBody.includes('"summary": "📄 Создано 1/1"'), execBody.slice(0, 100));
 
   let parsed;
   try {
@@ -216,7 +216,7 @@ console.log("\n[2] sheets_create: Google API кидает ошибку при cr
   const execResp = await cli.callTool({ name: "sheets_create", arguments: { manifest_id: manifestId, user_reply: "да" } });
   const execBody = text(execResp);
   console.log("  EXEC RAW (forced error):", execBody.slice(0, 500));
-  check("summary отражает провал (0/1, иконка ⚠️, есть 'с ошибкой')", execBody.includes('"summary": "⚠️ Created 0/1 (1 с ошибкой)"'), execBody.slice(0, 100));
+  check("summary отражает провал (0/1, иконка ⚠️, есть 'с ошибкой')", execBody.includes('"summary": "⚠️ Создано 0/1 (1 с ошибкой)"'), execBody.slice(0, 100));
   let parsed;
   try { parsed = JSON.parse(execBody); } catch { parsed = null; }
   check("results[0].error содержит текст ошибки Google", parsed?.results?.[0]?.error?.includes("Quota exceeded"), JSON.stringify(parsed?.results));
@@ -224,7 +224,7 @@ console.log("\n[2] sheets_create: Google API кидает ошибку при cr
   check("ничего не появилось в мире", world.spreadsheets.size === 0);
   // buildMutationResult: outcome = okN > 0 ? "confirmed" : "failed" — здесь okN=0 (единственный item провалился),
   // поэтому правильный (честный) исход аудита — "failed", не "confirmed".
-  check("аудит-запись: outcome=failed (okN=0, честно, не замаскировано под confirmed)", audits.some((a) => a.outcome === "failed" && a.postVerify?.includes("Created 0/1")), JSON.stringify(audits.map((a) => ({ o: a.outcome, pv: a.postVerify }))));
+  check("аудит-запись: outcome=failed (okN=0, честно, не замаскировано под confirmed)", audits.some((a) => a.outcome === "failed" && a.postVerify?.includes("Создано 0/1")), JSON.stringify(audits.map((a) => ({ o: a.outcome, pv: a.postVerify }))));
 }
 
 // ── [3] ветка ОТКЛОНИТЬ: user_reply = "нет" ──────────────────────────────────

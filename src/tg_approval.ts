@@ -117,6 +117,47 @@ function clipPreview(s: string, max = PREVIEW_CAP): string {
 }
 
 /**
+ * Matches a line that is an instruction AIMED AT A MODEL, not at the human
+ * reading the chat — e.g. `_[агенту: перепечатай дословно]_`
+ * (`tools/sheets.ts`'s `renderVerifyReport`, `consent.ts`'s `renderPlanned`).
+ * Such a line is meaningful when a model reads the tool response and decides
+ * how to relay it, but becomes a leak once handed straight to a human via
+ * `reportAutoExecutionResult` (below) — that path runs with NO model in the
+ * loop at all (`autoExecute.ts`'s file-top comment). Found live on drive-mcp
+ * (task #131, 2026-08-06): raw JSON plus this exact directive line reached
+ * Telegram verbatim. Matched anywhere in the line, not just at its start — a
+ * directive is dropped whole-line rather than partially edited, since a
+ * partially-edited line could still read as a garbled instruction. Covers RU
+ * "агенту" and EN "agent" — this is a security boundary, not a copy-editing
+ * concern, so it doesn't rely on the directive text staying in any one
+ * language.
+ */
+const AGENT_DIRECTIVE_LINE = /\[\s*(агенту|agent)\s*:/i;
+
+/**
+ * Strips every agent-directive line from a block of text. Exported so
+ * `report.ts`'s `renderAutoExecuteReport` can apply it while building the
+ * report from a tool's `structuredContent`, AND so `reportAutoExecutionResult`
+ * (below) can apply it again, unconditionally, right before the Telegram API
+ * call — the one required last-mile guard that every auto-execute report is
+ * guaranteed to pass through, so a future caller (in this repo or the 4 this
+ * module is ported to byte-for-byte) that forgets to sanitize its own text
+ * still can't leak a directive line to Telegram through here. Lives in this
+ * file (not report.ts) so `report.ts`'s only local runtime dependency is this
+ * one, and the several `scripts/*.mjs` tests that load `tg_approval.ts`
+ * directly via Node's native TypeScript support (no bundler, no `tsx`) keep
+ * working without this file gaining a new cross-module import of its own.
+ */
+export function stripAgentDirectives(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => !AGENT_DIRECTIVE_LINE.test(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
  * Конвертер лёгкого markdown (того же, что рендерят `renderConsentBlock`/
  * `ConsentPlan.preview` в consent.ts — `### заголовок`, `**жирный**`,
  * `` `код` ``, `_курсив_`) в Telegram HTML parse_mode. Раньше `sendMessage`
@@ -189,6 +230,17 @@ async function tgCall(cfg: TgApprovalConfig, method: string, body: unknown): Pro
  * Best-effort: если чат/сообщение недоступны (человек удалил сообщение
  * руками) — не бросает, просто логирует, реальное исполнение УЖЕ произошло
  * и не должно откатываться из-за того, что отчёт некуда вписать.
+ *
+ * `reportText` here MUST already be `report.ts`'s `renderAutoExecuteReport`
+ * output (human-readable markdown, not JSON) — `http.ts`'s
+ * `runAutoExecutePoller` is the only caller in production. `stripAgentDirectives`
+ * is re-applied here anyway (task #131, 2026-08-06 — found live on drive-mcp:
+ * raw JSON, including a line addressed AT A MODEL rather than at Maksim,
+ * reached this exact call unfiltered) as the LAST possible line of defense
+ * before the Telegram API call: this is the one function every auto-execute
+ * report is guaranteed to pass through, so a future caller (in this repo or
+ * the 4 this module is ported to byte-for-byte) that forgets to sanitize its
+ * own text still can't leak a directive line to Telegram through here.
  */
 export async function reportAutoExecutionResult(
   cfg: TgApprovalConfig,
@@ -200,10 +252,11 @@ export async function reportAutoExecutionResult(
     console.error("TG auto-execute: messageId отсутствует, отчёт некуда вписать (chat=" + chatId + ")");
     return;
   }
+  const safeReportText = stripAgentDirectives(reportText) || "Готово.";
   const res = await tgCall(cfg, "editMessageText", {
     chat_id: chatId,
     message_id: messageId,
-    text: mdToTelegramHtml(clipPreview(reportText)),
+    text: mdToTelegramHtml(clipPreview(safeReportText)),
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: [] },
   });
