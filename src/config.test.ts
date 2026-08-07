@@ -32,7 +32,6 @@ const RELEVANT_KEYS = [
   "TG_BOT_TOKEN_OVERRIDE",
   "TG_OWNER_CHAT_ID",
   "TG_APPROVAL_WEBHOOK_SECRET",
-  "TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE",
   "TG_APPROVAL_TOOLS",
   "TG_APPROVAL_TTL_MS",
   "TG_WEBHOOK_OWNER",
@@ -153,21 +152,12 @@ test("TG_BOT_TOKEN_OVERRIDE set alone (no TG_BOT_TOKEN at all) => still resolves
   });
 });
 
-test("TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE unset => falls back to the shared TG_APPROVAL_WEBHOOK_SECRET even with ownBot=true", () => {
+test("webhookSecret has no own-bot override — always TG_APPROVAL_WEBHOOK_SECRET, even with ownBot=true (consistent with gmail/drive/calendar-mcp: no second flag, Railway's own per-service env namespace already covers per-server secrets)", () => {
   withEnv({ ...TG_APPROVAL_BASE, TG_BOT_TOKEN_OVERRIDE: "own-bot-token" }, () => {
     const cfg = loadTgApprovalConfig("sheets");
+    assert.equal(cfg.ownBot, true);
     assert.equal(cfg.webhookSecret, "shared-webhook-secret");
   });
-});
-
-test("TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE set => wins over the shared TG_APPROVAL_WEBHOOK_SECRET", () => {
-  withEnv(
-    { ...TG_APPROVAL_BASE, TG_BOT_TOKEN_OVERRIDE: "own-bot-token", TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE: "own-secret" },
-    () => {
-      const cfg = loadTgApprovalConfig("sheets");
-      assert.equal(cfg.webhookSecret, "own-secret");
-    },
-  );
 });
 
 test("ownBot=true + missing TG_OWNER_CHAT_ID => still throws loudly (own-bot mode doesn't relax the other required fields)", () => {

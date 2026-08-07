@@ -421,17 +421,17 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   const botToken = botTokenOverride || process.env.TG_BOT_TOKEN?.trim() || "";
   const ownBot = !!botTokenOverride;
   const ownerChatId = process.env.TG_OWNER_CHAT_ID?.trim() || "";
-  // TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE mirrors TG_BOT_TOKEN_OVERRIDE's
-  // opt-in-per-server shape: unset (default) => the shared secret, same as
-  // today. A server with its own bot (`ownBot`) MAY also get its own webhook
-  // secret this way, so a leak of one server's secret doesn't let an attacker
-  // probe every other server's `/tg/webhook` too — but it's not required:
-  // the shared secret still works for an `ownBot` server that doesn't bother
-  // setting the override (see the port instructions' §5 rationale).
-  const webhookSecret =
-    process.env.TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE?.trim() ||
-    process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() ||
-    "";
+  // Deliberately NOT mirrored with a TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE:
+  // every MCP server already runs in its own Railway env-namespace, so
+  // Maksim can set a different TG_APPROVAL_WEBHOOK_SECRET value per server
+  // today, with zero code — a second override flag here would just be a
+  // second name for the same capability. Kept consistent across all 5
+  // TS repos (gmail/drive/calendar/docs/sheets-mcp — tg_approval.ts is
+  // byte-for-byte identical between them); drive-mcp/gmail-mcp/calendar-mcp
+  // independently settled on the same plain reuse. See TG_BOT_TOKEN_OVERRIDE
+  // above for the one flag this port actually needed a new name for (the bot
+  // token IS shared today — the secret was never shared to begin with).
+  const webhookSecret = process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() || "";
   const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
   const publicBaseUrl =
     process.env.PUBLIC_BASE_URL?.trim() || (railwayDomain ? `https://${railwayDomain}` : "");
@@ -454,7 +454,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
     const missing = [
       !botToken && "TG_BOT_TOKEN (or TG_BOT_TOKEN_OVERRIDE)",
       !ownerChatId && "TG_OWNER_CHAT_ID",
-      !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET (or TG_APPROVAL_WEBHOOK_SECRET_OVERRIDE)",
+      !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET",
       !publicBaseUrl && "PUBLIC_BASE_URL (or RAILWAY_PUBLIC_DOMAIN)",
     ]
       .filter(Boolean)
