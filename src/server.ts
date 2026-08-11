@@ -7,6 +7,7 @@ import { registerTriageTools } from "./tools/triage.js";
 import type { ConsentStore, ConsentConfig } from "./consent.js";
 import type { TgApprovalStore, TgApprovalGate } from "./tg_approval.js";
 import { createTgApprovalGate } from "./tg_approval.js";
+import { makeCheckAutomationKey } from "./automation_key.js";
 import {
   storeReady,
   createManifest,
@@ -21,6 +22,7 @@ import {
   getTgApproval,
   consumeTgDecision,
   consumeTgDecisionAnyServer,
+  getAutomationWindowByTokenHash,
 } from "./store.js";
 
 /**
@@ -96,6 +98,18 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
  * above: this object is not yet reachable from any gated tool in THIS repo. */
 export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter);
 
+/**
+ * `checkAutomationKey` DI for `consent.ts`'s `RequireConsentParams` (ТЗ
+ * `TZ_automation_key_consent_gate.md`). Reads the SAME shared
+ * `tg_automation_windows` table gmail-mcp writes to (same DATABASE_URL —
+ * `getAutomationWindowByTokenHash` in store.ts), never writes to it. Always
+ * constructed (even without Postgres configured — `getAutomationWindowByTokenHash`
+ * degrades to returning `null` when `storeReady()` is false, so this simply
+ * always answers `{ok:false}` in that case, same honest-degradation shape as
+ * `consentStore`/`auditStore` above).
+ */
+export const checkAutomationKey = makeCheckAutomationKey({ getAutomationWindowByTokenHash });
+
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);
   const accountsHint = clients.multi
@@ -115,6 +129,7 @@ export function buildMcpServer(user: User): McpServer {
     consentCfg: consentServerConfig,
     auditStore: storeReady() ? auditStoreAdapter : null,
     tg: tgApprovalGate,
+    checkAutomationKey,
   };
   registerAccountTools(server, clients);
   registerSheetsTools(server, clients, consentCtx);

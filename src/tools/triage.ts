@@ -13,7 +13,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { ok, fail, guard, safeText } from "../util.js";
 import { getAutoExecuteClients, type UserClients } from "../accounts.js";
-import { requireConsent, sha256, USER_REPLY_DOC, type ConsentStore } from "../consent.js";
+import { requireConsent, sha256, USER_REPLY_DOC, AUTOMATION_KEY_DOC, type ConsentStore } from "../consent.js";
 import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 import { renderAutoExecuteReport } from "../report.js";
 import type { SheetsConsentContext } from "./sheets.js";
@@ -290,11 +290,12 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ rows, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ rows, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -314,6 +315,8 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!rows || !rows.length) {
             throw new Error("Нужен непустой `rows`, чтобы построить план добавления.");
@@ -366,11 +369,12 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false, idempotentHint: true },
     },
-    guard(async ({ id, status, maksimSaid, whyNotClosed, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ id, status, maksimSaid, whyNotClosed, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Обновление недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -390,6 +394,8 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           const snap = await liveRowSnapshot(g, id);
           if (!snap) throw new Error(`Triage log entry with ID ${id} not found.`);
