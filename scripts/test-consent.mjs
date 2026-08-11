@@ -365,5 +365,119 @@ console.log("\n[15] интеграция: «not sure» → НЕ confirmed; «о�
   check("«ну не знаю» манифест ЖИВ (AWAITING)", p3.store.manifests.get(id3).status === "AWAITING_CONSENT");
 }
 
+// ── 16. automation_key: checkAutomationKey не задан → побайтовый регресс ────
+console.log("\n[16] automationKey присутствует, но checkAutomationKey НЕ передан (undefined) → обычный путь");
+{
+  const store = makeStore();
+  // automationKey задан, DI не подключён — ветка должна быть выключена целиком,
+  // requireConsent идёт обычным путём (фаза плана, т.к. нет id/reply).
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", automationKey: "some-key", plan, rehash, store, cfg });
+  check("kind=planned (automation-ветка не сработала без DI)", dec.kind === "planned", JSON.stringify(dec).slice(0, 80));
+}
+
+// ── 17. automation_key валиден → исполнение с первого вызова ────────────────
+console.log("\n[17] валидный automation_key (мок DI ok:true) → confirmed с первого вызова, без manifest_id/user_reply");
+{
+  const store = makeStore();
+  const okCheck = async (key) => (key === "GOOD" ? { ok: true, channel: "window" } : { ok: false });
+  const dec = await requireConsent({
+    tool: "sheets_write_range",
+    accountLabel: "work",
+    automationKey: "GOOD",
+    checkAutomationKey: okCheck,
+    plan,
+    rehash,
+    store,
+    cfg,
+  });
+  check("kind=confirmed с первого вызова", dec.kind === "confirmed", JSON.stringify(dec).slice(0, 80));
+  check("payload из плана", dec.kind === "confirmed" && canonicalJson(dec.payload) === canonicalJson(PAYLOAD));
+  check("manifestId пустой — манифест не создавался", dec.kind === "confirmed" && dec.manifestId === "");
+  check("манифест в store реально НЕ создан", store.manifests.size === 0);
+  check("аудит несёт actor=automation", store.audits.at(-1).actor === "automation");
+  check("аудит несёт checks.automationKey = метка канала", store.audits.at(-1).checks.automationKey === "window");
+  check("аудит outcome=confirmed", store.audits.at(-1).outcome === "confirmed");
+}
+
+// ── 18. automation_key невалиден → тихий fallthrough (НЕ ошибка) ────────────
+console.log("\n[18] невалидный automation_key (мок DI ok:false) → тихий fallthrough на обычный план, не ошибка");
+{
+  const store = makeStore();
+  const badCheck = async () => ({ ok: false });
+  const dec = await requireConsent({
+    tool: "sheets_write_range",
+    accountLabel: "work",
+    automationKey: "BAD",
+    checkAutomationKey: badCheck,
+    plan,
+    rehash,
+    store,
+    cfg,
+  });
+  check("kind=planned (fallthrough, не отказ/ошибка)", dec.kind === "planned", JSON.stringify(dec).slice(0, 80));
+  check("превью не упоминает automation_key вообще", !dec.preview.includes("automation"));
+  check("манифест создан обычным путём", store.manifests.size === 1);
+}
+
+// ── 19. automation-путь: rehash разошёлся → отказ, не тихое исполнение ──────
+console.log("\n[19] automation-путь: binding (rehash) не совпал → refused, ничего не исполнено");
+{
+  const store = makeStore();
+  const okCheck = async () => ({ ok: true, channel: "window" });
+  const changedRehash = () => sha256({ changed: true });
+  const dec = await requireConsent({
+    tool: "sheets_write_range",
+    accountLabel: "work",
+    automationKey: "GOOD",
+    checkAutomationKey: okCheck,
+    plan,
+    rehash: changedRehash,
+    store,
+    cfg,
+  });
+  check("kind=refused (состояние изменилось)", dec.kind === "refused" && dec.result.includes("изменилось"), dec.result?.slice(0, 60));
+  check("манифест НЕ создан (не осталось артефакта)", store.manifests.size === 0);
+  check("аудит НЕ несёт outcome=confirmed для этого вызова", !store.audits.some((a) => a.outcome === "confirmed"));
+}
+
+// ── 20. automation-путь: превышение sendBatchMax → тот же отказ, что обычно ─
+console.log("\n[20] automation-путь: батч > SEND_BATCH_MAX → 🛑, тот же текст, что на обычном пути");
+{
+  const store = makeStore();
+  const okCheck = async () => ({ ok: true, channel: "window" });
+  const bigPlan = () => ({ payload: PAYLOAD, objectHash: OBJHASH, preview: "p", batchSize: 11 });
+  const dec = await requireConsent({
+    tool: "sheets_write_range",
+    accountLabel: "work",
+    automationKey: "GOOD",
+    checkAutomationKey: okCheck,
+    plan: bigPlan,
+    rehash,
+    store,
+    cfg,
+  });
+  check("kind=refused (батч)", dec.kind === "refused");
+  check("тот же текст, что у обычного batch-cap отказа", dec.result.includes("Разбей") || dec.result.includes("больше предела"), dec.result?.slice(0, 80));
+  check("манифест НЕ создан", store.manifests.size === 0);
+}
+
+// ── 21. automation-путь: пустой automationKey === обычный путь ──────────────
+console.log("\n[21] automationKey = '' (пустая строка) → ветка не активируется, даже если DI подключён");
+{
+  const store = makeStore();
+  const okCheck = async () => ({ ok: true, channel: "window" });
+  const dec = await requireConsent({
+    tool: "sheets_write_range",
+    accountLabel: "work",
+    automationKey: "",
+    checkAutomationKey: okCheck,
+    plan,
+    rehash,
+    store,
+    cfg,
+  });
+  check("kind=planned (пустой ключ не считается присланным)", dec.kind === "planned");
+}
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);
