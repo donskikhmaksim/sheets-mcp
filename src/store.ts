@@ -186,6 +186,67 @@ export async function ensureSchema(): Promise<void> {
   await p.query(
     `CREATE INDEX IF NOT EXISTS tg_approvals_cleanup_idx ON tg_approvals (server, status, expires_at)`,
   );
+
+  // ---- automation_key windows (shared ecosystem-wide table, READ-ONLY here —
+  // docs/TZ_automation_key_consent_gate.md). Writer is gmail-mcp's
+  // automation_key.ts exclusively; this server only SELECTs by token_hash to
+  // decide whether a caller-supplied automation_key covers "sheets" right
+  // now (checkAutomationKey in automation_key.ts below). CREATE TABLE IF NOT
+  // EXISTS + the legacy-`server`-column migration are copied byte-for-byte
+  // from gmail-mcp's store.ts (same shared Postgres, same idempotent
+  // migration applied independently by every server that touches this
+  // table — neither may assume another one already ran it first).
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS tg_automation_windows (
+      window_id       TEXT PRIMARY KEY,
+      token_hash      TEXT NOT NULL,
+      scope           TEXT,
+      label           TEXT,
+      created_at      BIGINT NOT NULL,
+      expires_at      BIGINT NOT NULL,
+      revoked_at      BIGINT,
+      created_by_chat TEXT NOT NULL
+    )
+  `);
+  await p.query(`ALTER TABLE tg_automation_windows ADD COLUMN IF NOT EXISTS scope TEXT`);
+  const legacyServerCol = await p.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name = 'tg_automation_windows' AND column_name = 'server'`,
+  );
+  if (legacyServerCol.rows.length) {
+    await p.query(`UPDATE tg_automation_windows SET scope = server WHERE scope IS NULL`);
+    await p.query(`ALTER TABLE tg_automation_windows ALTER COLUMN server DROP NOT NULL`);
+  }
+  await p.query(
+    `CREATE INDEX IF NOT EXISTS tg_automation_windows_token_idx ON tg_automation_windows (token_hash)`,
+  );
+}
+
+/** One row shaped for automation_key.ts's scope check — READ-ONLY lookup by
+ * token hash (never by window_id: the raw key the caller sends doesn't carry
+ * its window_id, only gmail-mcp's generation flow knows that mapping). null
+ * when no window (active or not) matches — the caller (automation_key.ts)
+ * treats "not found" and "found but not covering me" identically: `{ok:false}`,
+ * silent fallthrough, never an error. */
+export interface AutomationWindowLookup {
+  scope: string;
+  expiresAt: number;
+  revokedAt: number | null;
+}
+
+export async function getAutomationWindowByTokenHash(tokenHash: string): Promise<AutomationWindowLookup | null> {
+  if (!pool) return null;
+  const p = getPool();
+  const res = await p.query(
+    `SELECT scope, expires_at, revoked_at FROM tg_automation_windows WHERE token_hash = $1 ORDER BY created_at DESC LIMIT 1`,
+    [tokenHash],
+  );
+  if (!res.rows.length) return null;
+  const row = res.rows[0];
+  return {
+    scope: row.scope ?? "",
+    expiresAt: Number(row.expires_at),
+    revokedAt: row.revoked_at === null ? null : Number(row.revoked_at),
+  };
 }
 
 // ---- Google accounts (multi-account, one owner per instance) ----
