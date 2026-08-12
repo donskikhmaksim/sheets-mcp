@@ -479,5 +479,117 @@ console.log("\n[21] automationKey = '' (пустая строка) → ветк�
   check("kind=planned (пустой ключ не считается присланным)", dec.kind === "planned");
 }
 
+// ── 22-27. Гибридное короткое ожидание (TZ_consent_web_hub.md §1) ───────────
+// ВАЖНО про время: `sleep()` внутри consent.ts использует РЕАЛЬНЫЙ
+// `setTimeout` (не инъекцию часов — та нужна только для сравнений
+// `now() < deadline`, не для самой паузы). Поэтому ниже используются
+// МАЛЕНЬКИЕ реальные миллисекунды (десятки, не 25000/1000 продовых
+// дефолтов) — тесты остаются быстрыми, а обнаружение «человек подтвердил на
+// N-й итерации» реализовано через СЧЁТЧИК вызовов мока (не через реальное
+// время), так что результат детерминирован независимо от скорости машины.
+const syncCfg = { server: "sheets", consentTtlMs: 3_600_000, minConsentGapMs: 2_000, sendBatchMax: 10, syncWaitMs: 300, syncPollMs: 20 };
+
+console.log("\n[22] Часть 1 тест 1: syncWaitMs=0 → побайтовая совместимость (обычное planned, без опроса)");
+{
+  const store = makeStore();
+  let getManifestCalls = 0;
+  const origGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (...args) => { getManifestCalls++; return origGetManifest(...args); };
+  const cfgOff = { ...syncCfg, syncWaitMs: 0, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgOff });
+  check("kind=planned", dec.kind === "planned");
+  check("ни одного опроса стора (syncWaitMs=0 ⇒ ветка не существует)", getManifestCalls === 0, getManifestCalls);
+}
+
+console.log("\n[23] Часть 1 тест 2: подтверждено (ТГ-approval) в окне ожидания → confirmed с ПЕРВОГО вызова, без превью");
+{
+  const store = makeStore();
+  let checkApprovalCalls = 0;
+  const tg = {
+    enabledFor: () => true,
+    notifyPlan: async () => ({ ok: true }),
+    checkApproval: async () => {
+      checkApprovalCalls++;
+      return checkApprovalCalls < 2 ? "pending" : "approved"; // подтверждено на 2-й итерации опроса
+    },
+  };
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgSync, tg });
+  check("kind=confirmed с первого вызова", dec.kind === "confirmed", JSON.stringify(dec).slice(0, 100));
+  check("payload корректен (мутация реально произойдёт с этими данными)", dec.kind === "confirmed" && canonicalJson(dec.payload) === canonicalJson(PAYLOAD));
+  check("auditId присвоен", dec.kind === "confirmed" && typeof dec.auditId === "string");
+  check("манифест реально DONE (одноразовость соблюдена)", [...store.manifests.values()][0].status === "DONE");
+  check("проверено больше одной итерации (реально ждали)", checkApprovalCalls >= 2, checkApprovalCalls);
+  check("аудит: actor=tg_auto, outcome=confirmed", store.audits.at(-1).actor === "tg_auto" && store.audits.at(-1).outcome === "confirmed");
+}
+
+console.log("\n[24] Часть 1 тест 3: отклонено (ТГ) в окне ожидания → refused, мутации нет");
+{
+  const store = makeStore();
+  let checkApprovalCalls = 0;
+  const tg = {
+    enabledFor: () => true,
+    notifyPlan: async () => ({ ok: true }),
+    checkApproval: async () => {
+      checkApprovalCalls++;
+      return checkApprovalCalls < 2 ? "pending" : "rejected";
+    },
+  };
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgSync, tg });
+  check("kind=refused", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
+  check("манифест INVALIDATED (не DONE — мутации не было)", [...store.manifests.values()][0].status === "INVALIDATED");
+}
+
+console.log("\n[25] Часть 1 тест 4: никто ничего не сделал за окно → ОБЫЧНОЕ planned; регресс — второй вызов работает");
+{
+  const store = makeStore();
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgSync });
+  check("kind=planned (окно исчерпано)", dec.kind === "planned", JSON.stringify(dec).slice(0, 80));
+  check("манифест всё ещё AWAITING_CONSENT", [...store.manifests.values()][0].status === "AWAITING_CONSENT");
+  const id = dec.manifestId;
+  // регресс: обычный второй вызов с manifest_id+user_reply по-прежнему работает.
+  await new Promise((r) => setTimeout(r, 10));
+  const dec2 = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", manifestId: id, userReply: "да", plan, rehash, store, cfg: { ...cfgSync, minConsentGapMs: 0 } });
+  check("второй вызов (обычный путь) → confirmed", dec2.kind === "confirmed", JSON.stringify(dec2).slice(0, 80));
+}
+
+console.log("\n[26] Часть 1 тест 5: binding-чек срабатывает и на sync-пути → refused, манифест НЕ consumed");
+{
+  const store = makeStore();
+  let checkApprovalCalls = 0;
+  const tg = {
+    enabledFor: () => true,
+    notifyPlan: async () => ({ ok: true }),
+    checkApproval: async () => {
+      checkApprovalCalls++;
+      return checkApprovalCalls < 2 ? "pending" : "approved";
+    },
+  };
+  const changedRehash = () => sha256({ changed: true }); // «мир уехал» за время ожидания
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash: changedRehash, store, cfg: cfgSync, tg });
+  check("kind=refused (состояние изменилось)", dec.kind === "refused" && dec.result.includes("изменилось"), dec.result?.slice(0, 60));
+  check("манифест НЕ consumed (остался AWAITING_CONSENT)", [...store.manifests.values()][0].status === "AWAITING_CONSENT");
+}
+
+console.log("\n[27] Часть 1 тест 6: automation_key + sync одновременно → исполняет СРАЗУ, ни одной итерации опроса");
+{
+  const store = makeStore();
+  let getManifestCalls = 0;
+  const origGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (...args) => { getManifestCalls++; return origGetManifest(...args); };
+  const okCheck = async () => ({ ok: true, channel: "window" });
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({
+    tool: "sheets_write_range", accountLabel: "work", automationKey: "GOOD", checkAutomationKey: okCheck,
+    plan, rehash, store, cfg: cfgSync,
+  });
+  check("kind=confirmed (automation_key, до фазы плана/ожидания)", dec.kind === "confirmed");
+  check("ни одной итерации опроса стора (automation-ветка возвращает ДО sync-wait)", getManifestCalls === 0, getManifestCalls);
+  check("манифест вообще не создавался", store.manifests.size === 0);
+}
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

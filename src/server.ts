@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
-import { loadConsentGateConfig, loadTgApprovalConfig } from "./config.js";
+import { loadConsentGateConfig, loadTgApprovalConfig, loadConsentHubSecret } from "./config.js";
 import { buildUserClients, registerAccountTools } from "./accounts.js";
 import { registerSheetsTools, type SheetsConsentContext } from "./tools/sheets.js";
 import { registerTriageTools } from "./tools/triage.js";
@@ -23,6 +23,7 @@ import {
   consumeTgDecision,
   consumeTgDecisionAnyServer,
   getAutomationWindowByTokenHash,
+  listAwaitingConsent,
 } from "./store.js";
 
 /**
@@ -48,6 +49,20 @@ export const consentStoreAdapter: ConsentStore = {
  */
 export const auditStoreAdapter = { listConsentAudit, countConsentAudit };
 
+/** Read adapter for the consent-hub `GET /pending-consents` route
+ * (`TZ_consent_web_hub.md` §2) — separate from `consentStoreAdapter`
+ * (plan/execute gate contract) and `auditStoreAdapter` (audit history) since
+ * this is a third, purely-reading surface: "what's awaiting a human right
+ * now". See `consentHub.ts`. */
+export const pendingConsentsStoreAdapter = { listAwaitingConsent };
+
+/**
+ * Общий секрет веб-хаба подтверждений (`TZ_consent_web_hub.md` §2 п.3) —
+ * авторизует `GET /pending-consents` и `POST /pending-consents/decide` в
+ * http.ts. Пустая строка (не задан) ⇒ оба роута отвечают 404 — fail-closed.
+ */
+export const consentHubSecret = loadConsentHubSecret();
+
 /** This server's identity ($self = "sheets") in the shared consent_manifests/
  * consent_audit tables, plus the gate's TTL/anti-doublet/batch-cap knobs —
  * env-driven, see `loadConsentGateConfig` in config.ts. `now` is left unset
@@ -59,6 +74,8 @@ export const consentServerConfig: ConsentConfig = {
   consentTtlMs: consentGateEnv.consentTtlMs,
   minConsentGapMs: consentGateEnv.minConsentGapMs,
   sendBatchMax: consentGateEnv.sendBatchMax,
+  syncWaitMs: consentGateEnv.syncWaitMs,
+  syncPollMs: consentGateEnv.syncPollMs,
 };
 
 /**

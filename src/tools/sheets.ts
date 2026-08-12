@@ -94,6 +94,8 @@ const DEFAULT_CONSENT_CFG: ConsentConfig = {
   consentTtlMs: 3_600_000,
   minConsentGapMs: 2_000,
   sendBatchMax: 10,
+  syncWaitMs: 0,
+  syncPollMs: 1_000,
 };
 
 const DEFAULT_CONSENT_CTX: SheetsConsentContext = {

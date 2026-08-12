@@ -335,11 +335,31 @@ export interface ConsentGateConfig {
    * (plan §0.2/[R:полнота-7]); over the cap, the tool refuses with "split it
    * up" instead of creating a manifest. Env SEND_BATCH_MAX, default 10. */
   sendBatchMax: number;
+  /** Гибридное короткое ожидание (`TZ_consent_web_hub.md` §1) — сколько мс
+   * фаза плана готова подождать, опрашивая собственный стор, прежде чем
+   * вернуть обычное превью. Env CONSENT_SYNC_WAIT_MS, default 25000 (25с —
+   * с запасом под типовой ~60с таймаут MCP-клиента). `0` ⇒ ветка выключена
+   * целиком, поведение побайтово как раньше. */
+  syncWaitMs: number;
+  /** Интервал опроса внутри окна ожидания, мс. Env CONSENT_SYNC_POLL_MS,
+   * default 1000. */
+  syncPollMs: number;
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
   const raw = Number(process.env[name]);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+/** Same as `positiveIntEnv`, but accepts `0` as a meaningful, explicit value
+ * (used by CONSENT_SYNC_WAIT_MS=0, which must fully disable the hybrid-wait
+ * branch — `positiveIntEnv` would silently fall back to the default instead,
+ * since it treats 0 as "not set"). Negative/garbage values still fall back. */
+function nonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 export function loadConsentGateConfig(): ConsentGateConfig {
@@ -348,7 +368,22 @@ export function loadConsentGateConfig(): ConsentGateConfig {
     consentTtlMs: positiveIntEnv("CONSENT_TTL_MS", 3_600_000),
     minConsentGapMs: positiveIntEnv("MIN_CONSENT_GAP_MS", 2_000),
     sendBatchMax: positiveIntEnv("SEND_BATCH_MAX", 10),
+    syncWaitMs: nonNegativeIntEnv("CONSENT_SYNC_WAIT_MS", 25_000),
+    syncPollMs: positiveIntEnv("CONSENT_SYNC_POLL_MS", 1_000),
   };
+}
+
+/**
+ * Общий секрет веб-хаба подтверждений (`TZ_consent_web_hub.md` §2, "Backend"
+ * п.3) — авторизует `GET /pending-consents` и `POST /pending-consents/decide`
+ * (заголовок `X-Consent-Hub-Secret`, сравнение константным временем — см.
+ * `consentHub.ts`'s `hubSecretMatches`). Та же строка настраивается на всех
+ * 5 сервисах (gmail/sheets/calendar/docs/drive-mcp), как уже сделано для
+ * `AUTOMATION_KEY`. Не задан (пустая строка) ⇒ оба роута отвечают 404 —
+ * fail-closed, НЕ открытый доступ (http.ts проверяет именно это условие).
+ */
+export function loadConsentHubSecret(): string {
+  return process.env.CONSENT_HUB_SECRET?.trim() || "";
 }
 
 /**

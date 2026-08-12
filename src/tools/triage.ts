@@ -242,7 +242,7 @@ registerAutoExecutor("triage_log_update", {
 
 const DEFAULT_TRIAGE_CTX: SheetsConsentContext = {
   consentStore: null,
-  consentCfg: { server: "sheets", consentTtlMs: 3_600_000, minConsentGapMs: 2_000, sendBatchMax: 10 },
+  consentCfg: { server: "sheets", consentTtlMs: 3_600_000, minConsentGapMs: 2_000, sendBatchMax: 10, syncWaitMs: 0, syncPollMs: 1_000 },
   auditStore: null,
 };
 

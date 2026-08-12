@@ -191,6 +191,17 @@ export interface ConsentConfig {
   minConsentGapMs: number;
   /** Кап размера батча одного манифеста (env SEND_BATCH_MAX, дефолт 10). */
   sendBatchMax: number;
+  /**
+   * Гибридное короткое ожидание (ТЗ `TZ_consent_web_hub.md` §1): сколько мс
+   * фаза плана готова ПОДОЖДАТЬ, опрашивая собственный стор, прежде чем
+   * вернуть обычное превью. Env `CONSENT_SYNC_WAIT_MS`, дефолт 25000 (25с).
+   * `0` ⇒ ветка ВООБЩЕ не существует — ни одного лишнего чтения из БД, ни
+   * одной задержки, поведение побайтово как до этой правки.
+   */
+  syncWaitMs: number;
+  /** Интервал опроса внутри окна ожидания, мс. Env `CONSENT_SYNC_POLL_MS`,
+   * дефолт 1000. Не читается вовсе, если `syncWaitMs === 0`. */
+  syncPollMs: number;
   /** Инъекция часов (для тестов). Дефолт Date.now. */
   now?: () => number;
 }
@@ -322,6 +333,12 @@ function sortDeep(v: unknown): unknown {
 /** sha256(canonicalJson(value)) в hex — стабильный objectHash для binding. */
 export function sha256(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+/** Промисифицированная пауза — только для гибридного окна ожидания ниже
+ * (§1). Не экспортируется: не публичный API этого модуля. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Время в America/Los_Angeles как «5 авг, 07:15» (ТЗ A.4 — всегда LA, не UTC). */
@@ -651,6 +668,116 @@ export async function requireConsent<T = unknown>(
       previewBody =
         `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram — подтвердите кнопкой в ` +
         `боте, затем ответьте «да» здесь._`;
+    }
+
+    // ───── ГИБРИДНОЕ КОРОТКОЕ ОЖИДАНИЕ (ТЗ_consent_web_hub.md §1) ───────────
+    // После создания манифеста, ДО возврата превью — короткий read-only опрос
+    // СОБСТВЕННОГО стора: не подтвердил ли человек этот план ПРЯМО СЕЙЧАС,
+    // пока модель ещё внутри этого самого (первого) вызова тула.
+    // `cfg.syncWaitMs === 0` (или не задан) ⇒ ветка НЕ существует — ни одного
+    // лишнего чтения, ни одной задержки, поведение побайтово как раньше.
+    //
+    // БЕЗОПАСНОСТЬ ОТ ДВОЙНОГО ИСПОЛНЕНИЯ (за пределами буквы ТЗ, но того
+    // требует существующая архитектура — см. `tryAutoExecute` выше и
+    // `runAutoExecutePoller`/`POST /pending-consents/decide` в http.ts):
+    // «подтверждено» здесь означает СТРОГО «наш собственный вызов
+    // `store.consumeManifest` только что выиграл гонку» — точно так же, как в
+    // обычной ФАЗЕ ИСПОЛНЕНИЯ ниже (шаги (3.5)+(4)+(5)). Единственный сигнал
+    // «человек подтвердил ПРЯМО СЕЙЧАС, манифест ещё AWAITING_CONSENT»,
+    // доступный ЗДЕСЬ без риска задвоить мутацию, — внеполосный ТГ-фактор
+    // (`p.tg`): это ЕДИНСТВЕННЫЙ канал, где согласие разнесено на ДВА шага
+    // (флаг APPROVED отдельно от `consumeManifest`), поэтому можно безопасно
+    // «подсмотреть» его до того, как кто-то другой (10-секундный
+    // `runAutoExecutePoller`) консьюмит манифест сам — атомарный
+    // `consumeManifest` решает, кто именно выиграл.
+    //
+    // Если манифест исчез/стал DONE БЕЗ нашего собственного `consumeManifest`
+    // (кто-то другой — поллер ИЛИ веб-хаб `POST /pending-consents/decide`,
+    // Часть 2 — уже исполнил план ПОЛНОСТЬЮ, включая саму мутацию, через
+    // `tryAutoExecute`) — мы НЕ возвращаем `confirmed`: это заставило бы
+    // вызывающий тул исполнить мутацию ВТОРОЙ раз с тем же payload. В этом
+    // случае — как и при обычном исчерпании окна — просто отдаём ОБЫЧНОЕ
+    // превью: ничего не потеряно (следующий чат-«да» получит честный отказ
+    // «план не найден или истёк» в фазе исполнения ниже, а не тихую
+    // повторную мутацию). Веб-хаб при этом уже показал человеку результат в
+    // браузере СРАЗУ — этот short-wait просто ловит ДОПОЛНИТЕЛЬНЫЙ, самый
+    // приятный случай (подтверждение по кнопке в ТГ ровно в течение этого
+    // самого вызова тула), а не единственный способ получить «уже
+    // проверенное с первого вызова».
+    if (cfg.syncWaitMs && cfg.syncWaitMs > 0) {
+      const pollMs = cfg.syncPollMs && cfg.syncPollMs > 0 ? cfg.syncPollMs : 1000;
+      const deadline = now() + cfg.syncWaitMs;
+      while (now() < deadline) {
+        await sleep(pollMs);
+        const row = await store.getManifest(id, cfg.server);
+        if (!row || row.status !== "AWAITING_CONSENT") {
+          if (row?.status === "INVALIDATED") {
+            return refuse(
+              "Отменено пользователем",
+              row.userReply
+                ? `Пользователь ответил отказом («${inlineReply(row.userReply)}»). План отменён, ничего не ` +
+                  "отправлено. Чтобы повторить — построй план заново."
+                : "План отменён, ничего не отправлено. Чтобы повторить — построй план заново.",
+              { syncWait: "invalidated" },
+              { manifestId: id, objectHash: row.objectHash, outcome: "invalidated", reason: "negation" },
+            );
+          }
+          // status === "DONE" где-то ВНЕ этого вызова, ИЛИ строка исчезла —
+          // см. комментарий про двойное исполнение выше: НЕ подтверждаем
+          // сами, просто прекращаем опрос и уходим в обычное превью ниже.
+          break;
+        }
+        if (p.tg?.enabledFor(tool)) {
+          const approval = await p.tg.checkApproval(id);
+          if (approval === "rejected") {
+            await store.invalidateManifest(id, cfg.server, "");
+            return refuse(
+              "Отклонено в Telegram",
+              "🛑 Действие отклонено кнопкой в Telegram. План отменён, ничего не отправлено. Чтобы " +
+                "повторить — построй план заново.",
+              { syncWait: "tg_rejected" },
+              { manifestId: id, objectHash: row.objectHash, outcome: "invalidated", reason: "tg_rejected" },
+            );
+          }
+          if (approval === "approved") {
+            // Тот же binding-чек (4), что и в обычной фазе исполнения — план
+            // мог устареть даже за пару секунд ожидания.
+            const currentHash = await rehash(built.payload);
+            if (currentHash !== built.objectHash) {
+              return refuse(
+                "Состояние изменилось после планирования",
+                "Объекты, к которым относился план, изменились (получатель/содержимое " +
+                  "«уехали»). Ради безопасности исполнение отклонено — построй план заново.",
+                { syncWait: "binding_mismatch" },
+                { manifestId: id, objectHash: built.objectHash },
+              );
+            }
+            // Атомарный consume — засчитывается ТОЛЬКО если это МЫ выигрываем
+            // гонку (см. комментарий выше). Если кто-то другой (поллер)
+            // успел первым — `consumed === null`, и мы просто выходим из
+            // ветки без `confirmed` (fallthrough в `break` ниже).
+            const consumed = await store.consumeManifest(id, cfg.server, TG_AUTO_REPLY_MARKER);
+            if (consumed) {
+              const auditId = randomUUID();
+              await store.appendConsentAudit({
+                id: auditId,
+                ts: now(),
+                server: cfg.server,
+                tool,
+                accountLabel,
+                manifestId: id,
+                objectHash: built.objectHash,
+                userReply: TG_AUTO_REPLY_MARKER,
+                checks: { tgApproval: "approved", binding: "ok", oneShot: "ok", syncWait: "confirmed" },
+                outcome: "confirmed",
+                actor: "tg_auto",
+              });
+              return { kind: "confirmed", manifestId: id, payload: consumed.payload as T, auditId };
+            }
+            break;
+          }
+        }
+      }
     }
 
     return { kind: "planned", manifestId: id, preview: renderPlanned(previewBody, id, expiresAt) };
