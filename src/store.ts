@@ -688,6 +688,35 @@ export async function consumeManifest(
   return rowToManifest(res.rows[0]);
 }
 
+/**
+ * All of THIS server's manifests currently AWAITING_CONSENT and not (yet)
+ * expired — read path for the consent-hub `GET /pending-consents` route
+ * (`TZ_consent_web_hub.md` §2). Newest-plan-first is less useful here than
+ * oldest-first (a human clearing a queue wants to work through it in the
+ * order things arrived), so this orders `created_at ASC`, the opposite of
+ * `listConsentAudit`'s newest-first history view. `limit` caps defensively
+ * (a human queue realistically never has hundreds of items; unlike
+ * `listConsentAudit` there's no pagination need — an unbounded backlog this
+ * large would itself be the actual problem to fix, not something to paginate
+ * through in the hub UI).
+ */
+export async function listAwaitingConsent(
+  server: string,
+  nowMs: number,
+  limit = 200,
+): Promise<ConsentManifestRow[]> {
+  if (!pool) return [];
+  const p = getPool();
+  const res = await p.query(
+    `SELECT * FROM consent_manifests
+      WHERE server = $1 AND status = 'AWAITING_CONSENT' AND expires_at > $2
+      ORDER BY created_at ASC
+      LIMIT $3`,
+    [server, nowMs, limit],
+  );
+  return res.rows.map(rowToManifest);
+}
+
 /** Marks a manifest INVALIDATED (explicit user negation). No-op if it's not
  * currently AWAITING_CONSENT for this server (already consumed/expired/invalidated). */
 export async function invalidateManifest(id: string, server: string, userReply: string): Promise<void> {

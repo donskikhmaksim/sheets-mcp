@@ -19,10 +19,18 @@ import {
 import { renderDashboard } from "./dashboard.js";
 import { logDashboardLocation } from "./logRedaction.js";
 import { buildUserClients, setAutoExecuteClients } from "./accounts.js";
-import { tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig } from "./server.js";
+import {
+  tgApprovalConfig,
+  tgApprovalStoreAdapter,
+  consentStoreAdapter,
+  consentServerConfig,
+  pendingConsentsStoreAdapter,
+  consentHubSecret,
+} from "./server.js";
 import { handleWebhook, registerWebhook, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor } from "./autoExecute.js";
+import { hubSecretMatches, listPendingConsentsCore, decideConsentHubItem } from "./consentHub.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -197,6 +205,65 @@ export async function startHttpServer(config: Config): Promise<void> {
       res.json({ service: AUTOMATION_SERVICE, tools });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ---- Consent-hub backend routes (TZ_consent_web_hub.md §2) ----
+  // GET /pending-consents + POST /pending-consents/decide -- the two routes
+  // every one of the 5 Google MCP servers exposes so gmail-mcp's hub page
+  // (and the macOS notifier, part 3) can aggregate/act across all of them.
+  // THIS repo does not render the hub page itself -- only these two JSON
+  // routes. Both fail CLOSED (404, not 401/403) when CONSENT_HUB_SECRET is
+  // unset -- same "don't confirm the route exists" reasoning as the webhook
+  // gate above, and the same fail-closed default `secretHubGuard` below
+  // documents. Checked BEFORE reading the header/body, same order as the
+  // `/tg/webhook` route-level gate.
+  const secretHubGuard = (req: Request, res: Response): boolean => {
+    if (!consentHubSecret) {
+      res.status(404).end();
+      return false;
+    }
+    const provided = req.header("x-consent-hub-secret") ?? "";
+    if (!hubSecretMatches(provided, consentHubSecret)) {
+      res.status(404).end();
+      return false;
+    }
+    return true;
+  };
+
+  app.get("/pending-consents", async (req: Request, res: Response) => {
+    if (!secretHubGuard(req, res)) return;
+    try {
+      const result = await listPendingConsentsCore(pendingConsentsStoreAdapter, consentServerConfig.server, Date.now());
+      res.json(result);
+    } catch (err) {
+      console.error("GET /pending-consents error:", err);
+      res.status(500).json({ error: "internal" });
+    }
+  });
+
+  app.post("/pending-consents/decide", async (req: Request, res: Response) => {
+    if (!secretHubGuard(req, res)) return;
+    try {
+      const result = await decideConsentHubItem(req.body ?? {}, {
+        store: consentStoreAdapter,
+        cfg: consentServerConfig,
+        getExecutor: getAutoExecutor,
+        buildExecCtx: async () => {
+          const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
+          if (!user) return null;
+          const clients = buildUserClients(user);
+          // Same publication as runAutoExecutePoller below -- module-scope
+          // registered `rehash`/`execute` callbacks resolve a live
+          // GoogleClients for the manifest's own account through this.
+          setAutoExecuteClients(clients);
+          return { clients, consentStore: consentStoreAdapter };
+        },
+      });
+      res.status(result.status).json(result.body);
+    } catch (err) {
+      console.error("POST /pending-consents/decide error:", err);
+      res.status(500).json({ error: "internal" });
     }
   });
 
