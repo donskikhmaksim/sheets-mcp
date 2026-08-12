@@ -260,12 +260,18 @@ export interface RequireConsentParams<T = unknown> {
   automationKey?: string;
   /**
    * DI: проверяет ключ на предмет "покрывает ли он МЕНЯ (этот сервис) прямо
-   * сейчас". Undefined ⇒ ветка automation_key целиком выключена — побайтовое
-   * поведение как раньше. Реализация (гуглит `tg_automation_windows` по
-   * sha256 ключа) живёт в `automation_key.ts` каждого сервера — DI, не
-   * runtime-импорт, тем же приёмом, что `ConsentStore`/`TgApprovalGate` выше.
+   * сейчас, конкретно вот этот `tool`". Undefined ⇒ ветка automation_key
+   * целиком выключена — побайтовое поведение как раньше. `tool` вторым
+   * аргументом — вызывается САМА `requireConsent` с тем же `tool`, что уже
+   * пришёл в `p.tool` (ТЗ `TZ_automation_key_method_catalog.md`, раздел 4);
+   * ни один вызывающий инструмент (`src/tools/*.ts`) это не трогает — они
+   * передают `checkAutomationKey` как ссылку на функцию, не вызывают её сами.
+   * Реализация (гуглит `tg_automation_windows` по sha256 ключа, сверяет
+   * scope через `scopeCovers(scope, service, tool)`) живёт в
+   * `automation_key.ts` каждого сервера — DI, не runtime-импорт, тем же
+   * приёмом, что `ConsentStore`/`TgApprovalGate` выше.
    */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Размеченный union исхода. Отказы — здесь, НЕ через throw. */
@@ -544,7 +550,7 @@ export async function requireConsent<T = unknown>(
   // scope ключ не блокирует и не подсказывает модели, что параметр вообще
   // существует — просто не даёт бонуса).
   if (p.automationKey && p.checkAutomationKey) {
-    const ak = await p.checkAutomationKey(p.automationKey);
+    const ak = await p.checkAutomationKey(p.automationKey, tool);
     if (ak.ok) {
       const built = await plan();
       if (built.batchSize != null && built.batchSize > cfg.sendBatchMax) {

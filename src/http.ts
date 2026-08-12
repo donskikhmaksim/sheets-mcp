@@ -5,6 +5,8 @@ import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelconte
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { Account, Config, User } from "./config.js";
 import { buildMcpServer } from "./server.js";
+import { listGatedTools } from "./gated_tools_catalog.js";
+import { AUTOMATION_SERVICE } from "./automation_key.js";
 import { GoogleFederatedProvider } from "./oauthProvider.js";
 import {
   getGoogleAccounts,
@@ -178,6 +180,25 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.json({ status: "ok", endpoint: "/mcp" });
   });
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  // ---- automation_key method catalog (TZ_automation_key_method_catalog.md) ----
+  // Unauthenticated on purpose: this only lists TOOL NAMES + short descriptions
+  // (what a `tools/list` call would show any authorized MCP client anyway) —
+  // not sensitive data, needed by the gmail-mcp hub mini-app to render the
+  // "service → methods" checkbox tree without a manually maintained list.
+  // Built off a synthetic no-accounts `User` — this server's tool SET/schemas
+  // don't vary per user (only per-tool descriptions like the account hint do,
+  // see server.ts's `accountsHint`), so a real user isn't needed to enumerate
+  // which tools are gated.
+  app.get("/automation-key-catalog", async (_req: Request, res: Response) => {
+    try {
+      const server = buildMcpServer({ accounts: [], defaultAccount: "" });
+      const tools = await listGatedTools(server);
+      res.json({ service: AUTOMATION_SERVICE, tools });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
 
   // ---- Optional Telegram-approval webhook (plan-tg-approval.md) ----
   // Deliberately OUTSIDE the normal /mcp auth -- Telegram itself calls this,

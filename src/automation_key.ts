@@ -21,18 +21,28 @@ export function sha256Hex(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
-/** true if `scope` (the CSV/"all" column value straight out of
- * `tg_automation_windows`) covers `service`. `"all"` covers everything;
- * otherwise the scope is a comma-separated list of canonical service names
- * and `service` must appear in it verbatim (no substring matching — "docs"
- * must not match a scope entry like "google-docs"). */
-export function scopeCovers(scope: string, service: string): boolean {
+/**
+ * true if `scope` (the CSV/"all" column value straight out of
+ * `tg_automation_windows`) covers `tool` of `service`. `"all"` covers
+ * everything. Otherwise the scope is a comma-separated list of tokens, each
+ * either:
+ *   - a bare canonical service name (`sheets`) — covers ANY tool of that
+ *     service (backward compatible: windows issued before method-level
+ *     scoping existed still work exactly as before, no DB migration needed);
+ *   - `<service>:<tool>` (`sheets:sheets_write_range`) — covers ONLY that
+ *     one tool.
+ * Comparison is exact (`===`) token-by-token — no substring/`startsWith`
+ * matching, so `docs` doesn't match `google-docs` and `sheets:sheets_send`
+ * doesn't match `sheets:sheets_send_extra`.
+ */
+export function scopeCovers(scope: string, service: string, tool: string): boolean {
   const trimmed = scope.trim();
   if (trimmed === "all") return true;
-  return trimmed
+  const tokens = trimmed
     .split(",")
     .map((s) => s.trim())
-    .includes(service);
+    .filter(Boolean);
+  return tokens.some((t) => t === service || t === `${service}:${tool}`);
 }
 
 /** Minimal DI surface this module needs from `store.ts` — one read, by token
@@ -56,8 +66,8 @@ export interface AutomationWindowLookupStore {
 export function makeCheckAutomationKey(
   store: AutomationWindowLookupStore,
   now: () => number = Date.now,
-): (key: string) => Promise<{ ok: boolean; channel?: string }> {
-  return async (key: string) => {
+): (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }> {
+  return async (key: string, tool: string) => {
     const raw = (key ?? "").trim();
     if (!raw) return { ok: false };
     const tokenHash = sha256Hex(raw);
@@ -65,7 +75,7 @@ export function makeCheckAutomationKey(
     if (!row) return { ok: false };
     if (row.revokedAt != null) return { ok: false };
     if (row.expiresAt != null && row.expiresAt <= now()) return { ok: false };
-    if (!scopeCovers(row.scope, AUTOMATION_SERVICE)) return { ok: false };
+    if (!scopeCovers(row.scope, AUTOMATION_SERVICE, tool)) return { ok: false };
     return { ok: true, channel: "window" };
   };
 }

@@ -83,7 +83,7 @@ export interface SheetsConsentContext {
    * undefined ⇒ automation_key-ветка в `requireConsent` целиком выключена,
    * поведение побайтово как до этой правки. Реальное значение — `server.ts`'s
    * `checkAutomationKey` (читает общую `tg_automation_windows`). */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
