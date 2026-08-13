@@ -524,6 +524,28 @@ export function classifyReply(
   return "unknown";
 }
 
+// ─────────────────── Аварийный общий выключатель гейта ─────────────────────
+
+const GATE_DISABLED_ENV = "SHEETS_MCP_GATE_DISABLED";
+
+/**
+ * Аварийный общий выключатель гейта подтверждения — 2026-08-12, по прямой
+ * просьбе Максима после разговора о том, что несколько MCP-серверов
+ * выключаются НЕ одним переключателем (см. тот же паттерн в ticktick-mcp,
+ * `_GATE_DISABLED_ENV`/`_gate_disabled()` в `ticktick_mcp/src/consent.py`).
+ * Точка отката ОДНА: переменная окружения, не правка кода — вернуть гейт
+ * можно, просто убрав переменную в Railway, без нового деплоя.
+ *
+ * Дефолт — гейт ВКЛЮЧЁН (переменная не задана = поведение не меняется).
+ * Когда выключен — КАЖДАЯ мутация проходит без user_reply/кнопки в
+ * Telegram; это буквально то, от чего весь `requireConsent` защищает (см.
+ * докстринг модуля выше). Максим предупреждён и подтвердил явно.
+ */
+function isGateDisabled(): boolean {
+  const raw = (process.env[GATE_DISABLED_ENV] ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 // ───────────────────────── Ядро: requireConsent ────────────────────────────
 
 export async function requireConsent<T = unknown>(
@@ -531,6 +553,31 @@ export async function requireConsent<T = unknown>(
 ): Promise<ConsentDecision<T>> {
   const { tool, accountLabel, plan, rehash, store, cfg } = p;
   const now = cfg.now ?? Date.now;
+
+  if (isGateDisabled()) {
+    console.error(
+      `🔓 ГЕЙТ ВЫКЛЮЧЕН переключателем ${GATE_DISABLED_ENV}: действие ` +
+        `'${tool}' (account=${accountLabel}) выполнено БЕЗ подтверждения пользователя.`,
+    );
+    const built = await plan();
+    const manifestId = randomUUID();
+    const auditId = randomUUID();
+    await store.appendConsentAudit({
+      id: auditId,
+      ts: now(),
+      server: cfg.server,
+      tool,
+      accountLabel,
+      manifestId,
+      objectHash: built.objectHash,
+      userReply: "",
+      checks: { gate: "disabled_switch" },
+      outcome: "confirmed",
+      actor: "human",
+    });
+    return { kind: "confirmed", manifestId, payload: built.payload as T, auditId };
+  }
+
   const manifestId = p.manifestId ?? "";
   const userReply = p.userReply ?? "";
   const hasId = manifestId !== "";
