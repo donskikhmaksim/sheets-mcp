@@ -16,6 +16,7 @@ import {
   invalidateManifest,
   appendConsentAudit,
   updateConsentAuditOutcome,
+  getExecutionAudit,
   listConsentAudit,
   countConsentAudit,
   createTgApproval,
@@ -39,6 +40,11 @@ export const consentStoreAdapter: ConsentStore = {
   invalidateManifest,
   appendConsentAudit,
   updateConsentAuditOutcome,
+  // Опциональный метод контракта (consent.ts): позволяет sync-wait'у вложить
+  // в отчёт `already_executed` фактический пруф post-verify того канала,
+  // который реально исполнил план. Без него отчёт остался бы честным, но
+  // пустым («результат не удалось перепроверить»).
+  getExecutionAudit,
 };
 
 /**

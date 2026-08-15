@@ -72,7 +72,46 @@ function makeStore() {
       const a = audits.find((x) => x.id === auditId);
       if (a) Object.assign(a, outcome);
     },
+    // Опциональный метод контракта (consent.ts) — им sync-wait достаёт
+    // ФАКТИЧЕСКИЙ результат чужого исполнения (пруф post-verify), чтобы
+    // отчёт `already_executed` не был голым «исполнено где-то там».
+    async getExecutionAudit(manifestId, server) {
+      const a = [...audits]
+        .reverse()
+        .find(
+          (x) =>
+            x.manifestId === manifestId &&
+            x.server === server &&
+            (x.outcome === "confirmed" || x.outcome === "failed"),
+        );
+      return a
+        ? { id: a.id, outcome: a.outcome, postVerifyResult: a.postVerify ?? null, error: a.error ?? null, actor: a.actor ?? null }
+        : null;
+    },
   };
+}
+
+/** Симуляция того, что делает веб-хаб (`POST /pending-consents/decide`):
+ * атомарно консьюмит манифест, пишет аудит-строку исполнения и дописывает в
+ * неё пруф post-verify — ровно как `tryAutoExecute` + per-tool `execute`. */
+async function simulateWebHubExecute(store, id, { postVerify = null, error = null } = {}) {
+  await store.consumeManifest(id, "sheets", "[веб-хаб: подтверждено]");
+  const auditId = "audit-" + id.slice(0, 8);
+  await store.appendConsentAudit({
+    id: auditId,
+    ts: 1,
+    server: "sheets",
+    tool: "sheets_write_range",
+    accountLabel: "work",
+    manifestId: id,
+    objectHash: null,
+    userReply: "[веб-хаб: подтверждено]",
+    checks: { source: "web_hub" },
+    outcome: error ? "failed" : "confirmed",
+    actor: "web",
+  });
+  await store.updateConsentAuditOutcome(auditId, { postVerify, error, outcome: error ? "failed" : "confirmed" });
+  return auditId;
 }
 
 const cfg = {
@@ -589,6 +628,87 @@ console.log("\n[27] Часть 1 тест 6: automation_key + sync одновр�
   check("kind=confirmed (automation_key, до фазы плана/ожидания)", dec.kind === "confirmed");
   check("ни одной итерации опроса стора (automation-ветка возвращает ДО sync-wait)", getManifestCalls === 0, getManifestCalls);
   check("манифест вообще не создавался", store.manifests.size === 0);
+}
+
+console.log("\n[28] чужой канал (веб-хаб) исполнил план в окне ожидания → kind=already_executed: НЕ отказ, НЕ повторное исполнение, с пруфом");
+{
+  const store = makeStore();
+  // Симулируем `POST /pending-consents/decide`, случившийся ПОКА этот вызов
+  // ждёт: манифест становится DONE ЧУЖИМИ руками (мутация уже сделана там),
+  // и вместе с ним появляется аудит-строка исполнения с пруфом post-verify.
+  let polls = 0;
+  const origGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (id, server) => {
+    polls++;
+    if (polls === 2) {
+      await simulateWebHubExecute(store, id, {
+        postVerify: "### 🧾 Независимая проверка записи\n\n- ✅ Лист1!A1:B2 — 4 ячейки на месте",
+      });
+    }
+    return origGetManifest(id, server);
+  };
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgSync });
+  // Защита от двойного исполнения (главное, что нельзя сломать): payload
+  // наружу не отдаётся — тул физически не может исполнить мутацию второй раз.
+  check("kind=already_executed (не refused и не confirmed)", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("payload НЕ отдан наружу (двойного исполнения не будет)", dec.payload === undefined);
+  check("текст — отчёт об исполнении, не отказ (нет 🛑)", !dec.report.includes("🛑") && dec.report.includes("ВЫПОЛНЕНА"), dec.report.slice(0, 160));
+  check("ФАКТИЧЕСКИЙ результат (пруф post-verify) донесён до модели", dec.report.includes("Независимая проверка записи") && dec.report.includes("4 ячейки"), dec.report.slice(-260));
+  check("auditId исполнившего канала возвращён", typeof dec.auditId === "string" && dec.auditId.startsWith("audit-"), String(dec.auditId));
+  check("манифест DONE (исполнил веб-хаб, не requireConsent)", [...store.manifests.values()][0].status === "DONE");
+}
+
+console.log("\n[29] чужой DONE, но пруфа достать неоткуда (стор без getExecutionAudit) → честное «не удалось перепроверить»");
+{
+  const store = makeStore();
+  delete store.getExecutionAudit;
+  let polls = 0;
+  const origGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (id, server) => {
+    polls++;
+    if (polls === 2) await store.consumeManifest(id, "sheets", "[веб-хаб: подтверждено]");
+    return origGetManifest(id, server);
+  };
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgSync });
+  check("kind=already_executed", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("честно сказано, что результат не перепроверен (а не выдуман успех)", dec.report.includes("не удалось перепроверить"), dec.report.slice(-260));
+  check("auditId отсутствует", dec.auditId === undefined);
+}
+
+console.log("\n[30] чужое исполнение УПАЛО → отчёт помечен ⚠️ и называет ошибку");
+{
+  const store = makeStore();
+  let polls = 0;
+  const origGetManifest = store.getManifest.bind(store);
+  store.getManifest = async (id, server) => {
+    polls++;
+    if (polls === 2) await simulateWebHubExecute(store, id, { error: "Google API 403: insufficient permissions" });
+    return origGetManifest(id, server);
+  };
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgSync });
+  check("kind=already_executed", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+  check("заголовок ⚠️, а не ✅", dec.report.includes("⚠️") && !dec.report.includes("✅"), dec.report.slice(0, 120));
+  check("текст ошибки донесён до модели", dec.report.includes("403"), dec.report.slice(-260));
+}
+
+console.log("\n[31] ТГ-ветка sync-wait (особенность sheets-mcp) НЕ затронута: кнопка в окне → по-прежнему confirmed с payload");
+{
+  const store = makeStore();
+  let checkApprovalCalls = 0;
+  const tg = {
+    enabledFor: () => true,
+    notifyPlan: async () => ({ ok: true }),
+    checkApproval: async () => (++checkApprovalCalls < 2 ? "pending" : "approved"),
+  };
+  const cfgSync = { ...syncCfg, now: undefined };
+  const dec = await requireConsent({ tool: "sheets_write_range", accountLabel: "work", plan, rehash, store, cfg: cfgSync, tg });
+  // Тут consumeManifest выигрываем МЫ, мутацию ещё НИКТО не делал — тул
+  // обязан её исполнить, поэтому это честный confirmed, а не отчёт.
+  check("kind=confirmed (мутацию делает вызывающий тул)", dec.kind === "confirmed", JSON.stringify(dec).slice(0, 100));
+  check("payload отдан наружу", dec.kind === "confirmed" && canonicalJson(dec.payload) === canonicalJson(PAYLOAD));
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

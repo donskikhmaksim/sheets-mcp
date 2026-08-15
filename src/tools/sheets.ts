@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { sheets_v4 } from "googleapis";
-import { ok, fail, guard, safeText, mapWithLimit, withRetry } from "../util.js";
+import { ok, okReport, okRefusal, fail, guard, safeText, mapWithLimit, withRetry } from "../util.js";
 import { accountField, getAutoExecuteClients, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import {
@@ -1550,7 +1550,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeWriteRangeCore(g, payload, auditId, consentStore);
@@ -1651,7 +1656,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeAppendRowsCore(g, payload, auditId, consentStore);
@@ -1743,7 +1753,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeClearRangeCore(g, payload, auditId, consentStore);
@@ -1831,7 +1846,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeCreateCore(g, payload, auditId, consentStore);
@@ -1919,7 +1939,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeAddTabCore(g, payload, auditId, consentStore);
@@ -2019,7 +2044,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeFindReplaceCore(g, payload, auditId, consentStore);
@@ -2135,7 +2165,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeFormatRangeCore(g, payload, auditId, consentStore);
@@ -2232,7 +2267,12 @@ export function registerSheetsTools(server: McpServer, clients: UserClients, ctx
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeRawBatchCore(g, payload, auditId, consentStore);

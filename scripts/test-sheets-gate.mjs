@@ -95,7 +95,7 @@ function buildClients(world) {
   };
 }
 
-async function harness(world) {
+async function harness(world, cfgOverrides = {}) {
   const clients = buildClients(world);
   const manifests = new Map();
   const audits = [];
@@ -129,8 +129,16 @@ async function harness(world) {
       const a = audits.find((x) => x.id === auditId);
       if (a) Object.assign(a, outcome);
     },
+    // Опциональный метод контракта consent.ts — из него sync-wait достаёт
+    // пруф post-verify чужого исполнения для отчёта `already_executed`.
+    async getExecutionAudit(manifestId, server) {
+      const a = [...audits]
+        .reverse()
+        .find((x) => x.manifestId === manifestId && x.server === server && (x.outcome === "confirmed" || x.outcome === "failed"));
+      return a ? { id: a.id, outcome: a.outcome, postVerifyResult: a.postVerify ?? null, error: a.error ?? null, actor: a.actor ?? null } : null;
+    },
   };
-  const consentCtx = { consentStore, consentCfg: { server: "sheets", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 }, auditStore: null };
+  const consentCtx = { consentStore, consentCfg: { server: "sheets", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10, ...cfgOverrides }, auditStore: null };
   const server = new McpServer({ name: "sheets-gate-e2e", version: "0" });
   registerAccountTools(server, clients);
   registerSheetsTools(server, clients, consentCtx);
@@ -138,7 +146,7 @@ async function harness(world) {
   const cli = new Client({ name: "c", version: "0" });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(b), cli.connect(a)]);
-  return { cli, manifests, world };
+  return { cli, manifests, world, consentStore, audits };
 }
 
 function extractManifestId(planText) {
@@ -407,6 +415,59 @@ console.log("\n[5] triage_log_update: plan phase does ZERO writes");
   check("execute succeeds with ✅", execBody.includes("✅"), execBody.slice(0, 120));
   check("status actually updated in the sheet", w.rows[1]?.[8] === "done", JSON.stringify(w.rows[1]));
   check("writes happened only on/after execute", w.writeOps.length > 0);
+}
+
+// ── [6] чужой канал исполнил план в окне sync-wait → отчёт, а не отказ ──────
+console.log("\n[6] sheets_write_range: подтверждено и исполнено «извне» в середине окна → ОДИН вызов тула, мутация НЕ дублируется, метка execution-report");
+{
+  const world = makeSheetWorld();
+  // Реальные (маленькие) миллисекунды: sleep внутри consent.ts у sheets —
+  // настоящий setTimeout, инъекции часов тут нет. Момент «исполнено извне»
+  // ловится СЧЁТЧИКОМ опросов, а не временем, поэтому результат
+  // детерминирован независимо от скорости машины.
+  const { cli, consentStore } = await harness(world, { syncWaitMs: 500, syncPollMs: 10 });
+  let polls = 0;
+  const origGetManifest = consentStore.getManifest.bind(consentStore);
+  consentStore.getManifest = async (id, server) => {
+    polls++;
+    if (polls === 2) {
+      // Симулируем `POST /pending-consents/decide`: он САМ исполняет мутацию
+      // через tryAutoExecute + per-tool execute (здесь — прямая запись в
+      // world, тем же способом, что и настоящий values.update), консьюмит
+      // манифест и пишет аудит-строку с пруфом post-verify.
+      world.ranges.get("S1").set("Sheet1!A1", [["written by hub"]]);
+      await consentStore.consumeManifest(id, "sheets", "[веб-хаб: подтверждено]");
+      await consentStore.appendConsentAudit({
+        id: "audit-hub-1", ts: Date.now(), server: "sheets", tool: "sheets_write_range",
+        accountLabel: "work", manifestId: id, objectHash: null,
+        userReply: "[веб-хаб: подтверждено]", checks: { source: "web_hub" },
+        outcome: "confirmed", actor: "web",
+      });
+      await consentStore.updateConsentAuditOutcome("audit-hub-1", {
+        outcome: "confirmed",
+        postVerify: "### 🧾 Независимая проверка записи\n\n- ✅ «My Sheet» Sheet1!A1 — 1 ячейка на месте",
+      });
+    }
+    return origGetManifest(id, server);
+  };
+
+  const resp = await cli.callTool({
+    name: "sheets_write_range",
+    arguments: { items: [{ spreadsheetId: "S1", range: "Sheet1!A1", values: [["written by hub"]] }] },
+  });
+  const body = text(resp);
+  check("тул НЕ вернул собственный отчёт об исполнении (не «Записано 1/1»)", !body.includes("Записано 1/1"), body.slice(0, 100));
+  check("_meta.kind = 'execution-report' (НЕ 'refusal')", resp._meta?.kind === "execution-report", JSON.stringify(resp._meta));
+  check("отчёт НЕ помечен 🛑 (это не отказ)", !body.includes("🛑"), body.slice(0, 120));
+  check("ФАКТИЧЕСКИЙ результат (пруф post-verify исполнившего канала) донесён до модели", body.includes("Независимая проверка записи"), body.slice(-300));
+  check("модели прямо сказано не повторять вызов", body.includes("повторять вызов"), body.slice(-400));
+  check("значение в мире записано ровно тем, что сделал хаб (тул не переписал повторно)", world.ranges.get("S1").get("Sheet1!A1")[0][0] === "written by hub");
+  check("подтверждение поймано опросом (>= 2 итерации)", polls >= 2, `polls=${polls}`);
+
+  // Регресс: настоящий ОТКАЗ обязан остаться отказом с меткой "refusal".
+  const refusedResp = await cli.callTool({ name: "sheets_write_range", arguments: { manifest_id: "нет-такого", user_reply: "да" } });
+  check("настоящий отказ по-прежнему помечен _meta.kind='refusal'", refusedResp._meta?.kind === "refusal", JSON.stringify(refusedResp._meta));
+  check("настоящий отказ по-прежнему несёт 🛑", text(refusedResp).includes("🛑"), text(refusedResp).slice(0, 80));
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);

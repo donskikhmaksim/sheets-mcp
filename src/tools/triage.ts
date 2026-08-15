@@ -11,7 +11,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { ok, fail, guard, safeText } from "../util.js";
+import { ok, okReport, okRefusal, fail, guard, safeText } from "../util.js";
 import { getAutoExecuteClients, type UserClients } from "../accounts.js";
 import { requireConsent, sha256, USER_REPLY_DOC, AUTOMATION_KEY_DOC, type ConsentStore } from "../consent.js";
 import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
@@ -338,7 +338,12 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeTriageLogAddCore(g, ACCOUNT, payload, auditId, consentStore);
@@ -417,7 +422,12 @@ export function registerTriageTools(server: McpServer, userClients: UserClients,
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
-      if (decision.kind === "refused") return ok(decision.result);
+      // Действие уже исполнено другим каналом (веб-хаб/ТГ-кнопка) — это ОТЧЁТ
+      // ОБ ИСПОЛНЕНИИ, а не отказ: payload наружу не пришёл, мутировать
+      // нечего, но модели отдаём его с меткой `execution-report`, чтобы она
+      // не повторяла вызов по кругу (жалоба Максима 2026-08-14).
+      if (decision.kind === "already_executed") return okReport(decision.report);
+      if (decision.kind === "refused") return okRefusal(decision.result);
 
       const { payload, auditId } = decision;
       return executeTriageLogUpdateCore(g, payload, auditId, consentStore);
