@@ -270,5 +270,31 @@ console.log("\n[5d] decide confirm: нет доступного пользова
   );
 }
 
+console.log("\n[5e] decide confirm — executor.execute БРОСАЕТ исключение → аудит получает outcome:\"failed\" (не остаётся \"confirmed\" без пруфа), HTTP-ответ НЕ ok:true/confirmed, текст ошибки не пересказан наружу дословно");
+{
+  const store = makeStore();
+  clock.t = 1_700_000_000_000;
+  const boom = new Error("Google API 403 at https://storage.googleapis.com/bucket/f?X-Goog-Signature=SECRETTOKEN123");
+  const executor = {
+    rehash: rehashOk,
+    execute: async () => {
+      throw boom;
+    },
+  };
+  const deps = {
+    store, cfg,
+    getExecutor: (tool) => (tool === "sheets_write_range" ? executor : undefined),
+    buildExecCtx: async () => ({ clients: { fake: true }, consentStore: store }),
+  };
+  const id = await seedManifest(store);
+  const r = await decideConsentHubItem({ manifestId: id, decision: "confirm" }, deps);
+  check("НЕ 200/confirmed — исполнение упало", !(r.status === 200 && r.body.outcome === "confirmed"), JSON.stringify(r));
+  check("HTTP-ответ не содержит текст исключения дословно (никакого SECRETTOKEN123)", !JSON.stringify(r.body).includes("SECRETTOKEN123"), JSON.stringify(r));
+  check("манифест всё равно DONE (consumeManifest — атомарный one-shot, произошёл ДО execute)", store.manifests.get(id).status === "DONE");
+  const failedRow = store.audits.find((a) => a.outcome === "failed");
+  check("аудит-строка получила outcome:\"failed\" (гарантированно, несмотря на исключение)", !!failedRow, JSON.stringify(store.audits));
+  check("текст ошибки в аудите есть, но query/токен из URL вырезаны", !!failedRow?.error && failedRow.error.includes("403") && !failedRow.error.includes("SECRETTOKEN123"), failedRow?.error);
+}
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

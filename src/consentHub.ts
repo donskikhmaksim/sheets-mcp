@@ -24,8 +24,9 @@
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { ConsentStore, ConsentConfig, ConsentManifestRow } from "./consent.js";
-import { canonicalJson, formatLaTime, tryAutoExecute } from "./consent.js";
+import { canonicalJson, formatLaTime, tryAutoExecute, stripUrlQuery } from "./consent.js";
 import type { AutoExecutorEntry, AutoExecutorCtx } from "./autoExecute.js";
+import { runAutoExecutorSafely } from "./autoExecute.js";
 
 // ───────────────────────── Секрет хаба ──────────────────────────────────────
 
@@ -112,6 +113,7 @@ export interface ConsentHubDecideDeps {
 export type ConsentHubDecideResult =
   | { status: 200; body: { ok: true; outcome: "confirmed"; result: string } }
   | { status: 200; body: { ok: true; outcome: "refused" } }
+  | { status: 200; body: { ok: false; outcome: "execution_failed" } }
   | { status: 400; body: { error: "bad_request" } }
   | { status: 404; body: { error: "not_found" } }
   | { status: 409; body: { error: "already_decided" | "binding_mismatch" | "not_supported" } }
@@ -197,6 +199,21 @@ export async function decideConsentHubItem(
     return { status: 409, body: { error: "binding_mismatch" } };
   }
 
-  const reportText = await executor.execute(result.payload, result.auditId, ctx);
+  let reportText: string;
+  try {
+    reportText = await runAutoExecutorSafely(executor, result.payload, result.auditId, ctx, deps.store.updateConsentAuditOutcome);
+  } catch (err) {
+    // `runAutoExecutorSafely` уже дописала outcome:"failed" в аудит-строку
+    // (см. её doc-comment) — здесь только решаем, что вернуть по HTTP.
+    // НЕ пересказываем `err.message` наружу дословно (security-checklist.md
+    // §6 — может содержать URL нижележащего API с query/токеном): хаб
+    // получает машиночитаемый статус, полный текст остаётся в аудит-логе
+    // (уже прогнан через `stripUrlQuery` внутри обёртки).
+    console.error(
+      `POST /pending-consents/decide: execute упал для ${row.tool}/${manifestId}:`,
+      stripUrlQuery(err instanceof Error ? err.message : String(err)),
+    );
+    return { status: 200, body: { ok: false, outcome: "execution_failed" } };
+  }
   return { status: 200, body: { ok: true, outcome: "confirmed", result: reportText } };
 }

@@ -28,8 +28,8 @@ import {
   consentHubSecret,
 } from "./server.js";
 import { handleWebhook, registerWebhook, reportAutoExecutionResult, secretTokenMatches } from "./tg_approval.js";
-import { tryAutoExecute } from "./consent.js";
-import { getAutoExecutor } from "./autoExecute.js";
+import { tryAutoExecute, stripUrlQuery } from "./consent.js";
+import { getAutoExecutor, runAutoExecutorSafely } from "./autoExecute.js";
 import { hubSecretMatches, listPendingConsentsCore, decideConsentHubItem } from "./consentHub.js";
 
 const JSONRPC_UNAUTHORIZED = {
@@ -158,7 +158,13 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
         consentServerConfig,
       );
       if (!result) continue; // гонка/дрейф/истёк — тихо пропускаем, это не ошибка
-      const reportText = await executor.execute(result.payload, result.auditId, { clients, consentStore: consentStoreAdapter });
+      const reportText = await runAutoExecutorSafely(
+        executor,
+        result.payload,
+        result.auditId,
+        { clients, consentStore: consentStoreAdapter },
+        consentStoreAdapter.updateConsentAuditOutcome,
+      );
       await reportAutoExecutionResult(tgApprovalConfig, c.chatId, c.messageId, reportText);
     } catch (err) {
       console.error(`TG auto-execute: ошибка при исполнении ${c.tool}/${c.manifestId}:`, err);
@@ -166,9 +172,12 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
       // успел вызвать consumeManifest (манифест одноразовый), повторной
       // попытки уже не будет; отчёт об ошибке всё равно стоит попытаться
       // отправить, чтобы Максим не остался с зависшими кнопками в боте.
+      // stripUrlQuery — текст ошибки уходит в Telegram (внешний канал, не
+      // только серверный лог) и НЕ должен нести query-параметры чужих URL
+      // (security-checklist.md §6).
       await reportAutoExecutionResult(
         tgApprovalConfig, c.chatId, c.messageId,
-        `🛑 Ошибка при автоисполнении «${c.tool}»: ${err instanceof Error ? err.message : String(err)}`,
+        `🛑 Ошибка при автоисполнении «${c.tool}»: ${stripUrlQuery(err instanceof Error ? err.message : String(err))}`,
       ).catch(() => {});
     }
   }
